@@ -63,6 +63,17 @@ describe("gate efficacy", () => {
     const cleanInput = CASES.find((x) => x.id === "diff-in-scope/clean")!.input;
     expect(runCase({ ...c, input: cleanInput }).status).toBe("missed");
   });
+  it("reports an open finding as known-gap without failing, and a fixed one as gap-fixed, which fails", () => {
+    const c = CASES.find((x) => x.id === "diff-in-scope/outside")!;
+    const cleanInput = CASES.find((x) => x.id === "diff-in-scope/clean")!.input;
+    const open = runCase({ ...c, input: cleanInput, knownGap: "F-0" });
+    expect(open.status).toBe("known-gap");
+    expect(allGood([open])).toBe(true);
+    const fixed = runCase({ ...c, knownGap: "F-0" });
+    expect(fixed.status).toBe("gap-fixed");
+    expect(allGood([fixed])).toBe(false);
+    expect(summarise([open]).find((x) => x.gateId === c.gateId)!.catchRate).toBe(0);
+  });
   it("counts a thrown gate as an error (fail closed)", () => {
     expect(runCase({ id: "x", gateId: "task.diff-in-scope", description: "", expect: "must-fail", input: null }).status).toBe("error");
   });
