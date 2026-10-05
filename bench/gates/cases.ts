@@ -6,6 +6,7 @@
 import type { DiffSummary } from "../../src/gates/predicates.js";
 import { ESTIMATE_CASES } from "./estimate-cases.js";
 import { SAFETY_CASES } from "./safety-cases.js";
+import { FLOW_CASES } from "./flow-cases.js";
 
 export interface GateCase {
   id: string;
@@ -33,4 +34,4 @@ const existing: GateCase[] = [
   { id: "lock-set/deleted", gateId: "task.lock-set-unchanged", description: "locked test file deleted", expect: "must-fail", input: { diff: { ...diff([]), lockedNow: { "t.test.ts": null } }, tests: { lock: [{ file: "t.test.ts", sha: "s1" }] } } },
 ];
 
-export const CASES: GateCase[] = [...existing, ...ESTIMATE_CASES, ...SAFETY_CASES];
+export const CASES: GateCase[] = [...existing, ...ESTIMATE_CASES, ...SAFETY_CASES, ...FLOW_CASES];
