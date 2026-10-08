@@ -32,6 +32,11 @@ export function getGate(id: string): GateDef | undefined {
   return registry.get(id);
 }
 
+/** Ids of every gate registered so far (the modules that define them must be imported first). */
+export function gateIds(): string[] {
+  return [...registry.keys()];
+}
+
 export function gateInputsHash(gateId: string, inputs: GateInputs, policy: Policy): string {
   return hashJson({ gateId, inputs, policy });
 }

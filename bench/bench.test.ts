@@ -7,6 +7,8 @@ import { buildEvidence } from "./external/evidence.js";
 import type { Openhands } from "./external/priors.js";
 import { CASES } from "./gates/cases.js";
 import { allGood, runCase, runCases, summarise } from "./gates/run.js";
+import { gateIds } from "../src/gates/index.js";
+import "../src/design/gates.js";
 
 const rec = (runId: string, stage: string, costUsd: number, wallMin = costUsd): BenchRecord => ({
   runId, step: stage, stage, outcome: "completed", wallMin, retries: 0, tokens: 0, costUsd, turns: 0,
@@ -54,6 +56,11 @@ describe("gate efficacy", () => {
     for (const g of ["e1-readiness", "e1b-design-baseline", "e1c-design-coverage", "e2-req-to-task", "e3-task-to-req", "e4-checklist", "e5-consistency", "e6-lint", "e7-approval"]) expect(ids.has(`estimate.${g}`)).toBe(true);
     for (const g of ["b1-scope-lock", "b2-change-request", "b3-size-cap", "b4-unrequested", "b5-budget-burn", "b6-screens-planned", "b7-screen-scope"]) expect(ids.has(`build.${g}`)).toBe(true);
   });
+  it("has a clean example and a seeded defect for every registered gate, so a new gate can't ship unchecked", () => {
+    const kinds = (id: string) => new Set(CASES.filter((c) => c.gateId === id).map((c) => c.expect));
+    const missing = gateIds().filter((id) => !kinds(id).has("must-pass") || !kinds(id).has("must-fail"));
+    expect(missing).toEqual([]);
+  });
   it("reports unregistered gates as pending, not as passes", () => {
     const r = runCase({ id: "x", gateId: "no-such-gate", description: "", expect: "must-fail", input: {} });
     expect(r.status).toBe("pending");
@@ -62,6 +69,17 @@ describe("gate efficacy", () => {
     const c = CASES.find((x) => x.id === "diff-in-scope/outside")!;
     const cleanInput = CASES.find((x) => x.id === "diff-in-scope/clean")!.input;
     expect(runCase({ ...c, input: cleanInput }).status).toBe("missed");
+  });
+  it("reports an open finding as known-gap without failing, and a fixed one as gap-fixed, which fails", () => {
+    const c = CASES.find((x) => x.id === "diff-in-scope/outside")!;
+    const cleanInput = CASES.find((x) => x.id === "diff-in-scope/clean")!.input;
+    const open = runCase({ ...c, input: cleanInput, knownGap: "F-0" });
+    expect(open.status).toBe("known-gap");
+    expect(allGood([open])).toBe(true);
+    const fixed = runCase({ ...c, knownGap: "F-0" });
+    expect(fixed.status).toBe("gap-fixed");
+    expect(allGood([fixed])).toBe(false);
+    expect(summarise([open]).find((x) => x.gateId === c.gateId)!.catchRate).toBe(0);
   });
   it("counts a thrown gate as an error (fail closed)", () => {
     expect(runCase({ id: "x", gateId: "task.diff-in-scope", description: "", expect: "must-fail", input: null }).status).toBe("error");
