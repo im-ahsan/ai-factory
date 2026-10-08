@@ -62,7 +62,8 @@ describe("run rows from the ledger", () => {
     expect(row.steps.find((s) => s.step === "intake")).toMatchObject({ costUsd: 0.01, tokens: { input: 1000, output: 100 }, attempts: 1 });
     // an older run without a recorded commit takes one from the command line
     expect(rowOf(l, { factoryCommit: "1c48558" }).factoryCommit).toBe("1c48558");
-    // the same run read from its archive
+    // the same run read from its archive (its events written out to the folder first: factory logs <run> --events)
+    l.exportFile();
     const tgz = join(mkdtempSync(join(tmpdir(), "runs-tgz-")), "r1.tar.gz");
     execFileSync("tar", ["-czf", tgz, "-C", dirname(l.dir), "r1"]);
     expect(rowOf(openRun(tgz))).toMatchObject({ runId: "r1", lockedTests: { passed: 1 } });

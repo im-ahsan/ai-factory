@@ -79,10 +79,19 @@ export async function repoRefusals(repo: string): Promise<{ code: string; reason
   return out;
 }
 
-/** Create the run's worktree on a new branch and lock it (run-manager §2.10). */
+/**
+ * Create the run's worktree on a new branch and lock it (run-manager §2.10). A run whose worktree folder was lost (deleted, or
+ * cleared with the temporary files) still has its branch: the worktree comes back on it, with the work committed so far.
+ */
 export async function addWorktree(repo: string, wtPath: string, branch: string, base: string, runId: string): Promise<void> {
   mkdirSync(join(wtPath, ".."), { recursive: true });
-  await git(repo, ["worktree", "add", "-b", branch, wtPath, base]);
+  const has = await git(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]).then(() => true, () => false);
+  if (has) {
+    // the lost folder is still registered, and locked: forget it first
+    await git(repo, ["worktree", "unlock", wtPath]).catch(() => undefined);
+    await git(repo, ["worktree", "prune"]);
+  }
+  await git(repo, has ? ["worktree", "add", wtPath, branch] : ["worktree", "add", "-b", branch, wtPath, base]);
   await git(repo, ["worktree", "lock", "--reason", `factory run ${runId}`, wtPath]);
 }
 

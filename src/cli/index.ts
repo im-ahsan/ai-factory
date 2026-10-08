@@ -206,7 +206,7 @@ program.command("status").argument("[run]").description("state, current step, co
     const steps = [...s.steps.values()];
     const current = s.inFlight?.step ?? steps.filter((x) => x.status !== "completed").pop()?.step ?? steps[steps.length - 1]?.step ?? "-";
     const shown = shownStatus(s), hint = statusHint(shown, id);
-    log(`${id}  ${shown.padEnd(11)} step ${current.padEnd(18)} $${s.costUsd.toFixed(2)}${s.openCard ? `  card: ${s.openCard.kind} ${s.openCard.artifactSha.slice(0, 8)}` : ""}${s.parkedReason ? `\n    parked: ${s.parkedReason}` : ""}${hint ? `\n    ${hint}` : ""}`);
+    log(`${id}  ${shown.padEnd(11)} step ${current.padEnd(18)} $${s.costUsd.toFixed(2)}${s.openCard ? `  card: ${s.openCard.kind} ${s.openCard.artifactSha.slice(0, 8)}${s.openCard.deadline ? ` (takes its recommended answers after ${s.openCard.deadline})` : ""}` : ""}${s.parkedReason ? `\n    parked: ${s.parkedReason}` : ""}${hint ? `\n    ${hint}` : ""}`);
     if (run) {
       const { lastActivity, fmtElapsed } = await import("../util/trace.js");
       const last = lastActivity(Ledger.open(id).dir);
@@ -416,10 +416,12 @@ program.command("logs").argument("<run>")
   .option("-f, --follow", "keep printing new lines while the run works (Ctrl+C to stop)")
   .option("--step <key>", "only lines of one step, e.g. plan or implement/TASK-1")
   .option("--full", "also print what the AI answered and each tool call's result, for every model turn")
+  .option("--events", "write the run's events to events.jsonl in its folder (to copy, archive or commit the folder), and stop")
   .description("the run's trace: every step, model turn, tool call, container phase and gate, with times")
-  .action(async (run: string, o: { follow?: boolean; step?: string; full?: boolean }) => {
+  .action(async (run: string, o: { follow?: boolean; step?: string; full?: boolean; events?: boolean }) => {
     const { readTrace, formatLine } = await import("../util/trace.js");
     const l = openRun(run);
+    if (o.events) return log(`${l.events().length} events written to ${l.exportFile()}`);
     const show = (e: import("../util/trace.js").TraceEvent) => {
       if (o.step && !(e.step === o.step || e.step?.startsWith(`${o.step}/`))) return;
       log(formatLine(e));

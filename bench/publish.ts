@@ -13,6 +13,7 @@ import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 import { scanText } from "../src/context/secrets.js";
+import { Ledger } from "../src/ledger/ledger.js";
 import { replay } from "../src/ledger/state.js";
 import { openRun, rowOf, type RunRow } from "./runs/row.js";
 import { markdown } from "./runs/run.js";
@@ -91,9 +92,9 @@ function filesUnder(d: string): string[] {
 export function findRun(runId: string): string | undefined {
   const tgz = join(ARCHIVE, `${runId}.tar.gz`);
   if (existsSync(tgz)) return tgz;
-  if (existsSync(join(REAL_HOME, "ledger", runId, "events.jsonl"))) return join(REAL_HOME, "ledger", runId);
+  if (Ledger.isRun(join(REAL_HOME, "ledger", runId))) return join(REAL_HOME, "ledger", runId);
   const evals = join(REAL_HOME, "tmp", "evals");
-  for (const h of existsSync(evals) ? readdirSync(evals) : []) if (existsSync(join(evals, h, "ledger", runId, "events.jsonl"))) return join(evals, h, "ledger", runId);
+  for (const h of existsSync(evals) ? readdirSync(evals) : []) if (Ledger.isRun(join(evals, h, "ledger", runId))) return join(evals, h, "ledger", runId);
   return undefined;
 }
 
@@ -121,6 +122,7 @@ export function publishRun(runId: string, opts: { forbidden?: string[]; evidence
   if (!PUBLIC_PROJECTS.has(info.project)) return { runId, refused: `project is not on the public allowlist (it stays on this machine)`, archiveKept: false, dropped: [] };
   const name = `${(info.runId.match(/^(\d{4})(\d{2})(\d{2})/) ?? []).slice(1).join("-")}-${info.runId.replace(/^\d{8}-/, "")}`;
   const folder = join(root, "runs", name);
+  ledger.exportFile(); // the published folder holds the events as a file
   const { dir, dropped } = scrubbedCopy(ledger.dir);
   try {
     // a run older than commit recording takes it from the command line, or keeps what an earlier publish was told
@@ -148,9 +150,9 @@ export function publicPaidRuns(): string[] {
   const dirs = [join(REAL_HOME, "ledger"), ...(existsSync(join(REAL_HOME, "tmp", "evals")) ? readdirSync(join(REAL_HOME, "tmp", "evals")).map((h) => join(REAL_HOME, "tmp", "evals", h, "ledger")) : [])];
   for (const d of dirs.filter(existsSync)) for (const id of readdirSync(d)) {
     try {
-      const first = JSON.parse(readFileSync(join(d, id, "events.jsonl"), "utf8").split("\n")[0]!) as { data?: { project?: string } };
-      if (!PUBLIC_PROJECTS.has(first.data?.project ?? "")) continue;
-      const cost = replay(openRun(join(d, id)).events()).costUsd;
+      const events = openRun(join(d, id)).events();
+      if (!PUBLIC_PROJECTS.has((events[0]?.data as { project?: string } | undefined)?.project ?? "")) continue;
+      const cost = replay(events).costUsd;
       if (cost > 0) ids.add(id);
     } catch { /* not a run folder */ }
   }

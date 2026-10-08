@@ -94,6 +94,8 @@ export function leaksOf(c: E2ECase, runId: string): string[] {
     }
   };
   for (const r of roots) walk(r);
+  // the run's events are in the home's database, not in a file under its folder
+  if (Ledger.exists(runId)) { const t = JSON.stringify(Ledger.open(runId).events()); for (const s of needles) if (t.includes(s)) hits.push(`ledger/${runId}/events: ${s}`); }
   return hits;
 }
 

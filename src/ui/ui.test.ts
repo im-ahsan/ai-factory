@@ -1570,7 +1570,7 @@ describe("factory ui: design exports", () => {
     expect((await call(`/scaffolds/${l.runId}/next-shadcn.zip`)).status).toBe(404);
     expect((await call(`/scaffolds/${l.runId}/..%2Fevents.jsonl`)).status).toBe(404);
     // each copy taken of the app is in the run's ledger (who, which target, where to)
-    const copies = readFileSync(join(l.dir, "events.jsonl"), "utf8").split("\n").filter(Boolean).map((x) => JSON.parse(x)).filter((e) => e.type === "scaffold.copied").map((e) => e.data);
+    const copies = l.events().filter((e) => e.type === "scaffold.copied").map((e) => e.data);
     expect(copies).toEqual([
       expect.objectContaining({ copy: "generate", target: "vite-shadcn", to: join(l.dir, "scaffold", "vite-shadcn"), files: expect.any(Number), by: expect.stringMatching(/\(via web\)$/) }),
       expect.objectContaining({ copy: "download", target: "vite-shadcn", to: `${l.runId}-vite-shadcn.zip` }),

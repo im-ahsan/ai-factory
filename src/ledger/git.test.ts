@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -25,6 +25,19 @@ describe("hardened git", () => {
     writeFileSync(join(repo, "b.txt"), "two\n");
     await commitAll(repo, "b");
     expect(existsSync(marker)).toBe(false);
+  });
+
+  it("brings a lost worktree back on the run's branch, with the work committed so far", async () => {
+    const repo = makeRepo();
+    const base = await headSha(repo);
+    const wt = join(mkdtempSync(join(tmpdir(), "factory-wt-")), "w1");
+    await addWorktree(repo, wt, "factory/run-1", base, "run-1");
+    writeFileSync(join(wt, "new.txt"), "x\n");
+    const sha = await commitAll(wt, "task");
+    rmSync(wt, { recursive: true, force: true });
+    await addWorktree(repo, wt, "factory/run-1", base, "run-1");
+    expect(await headSha(wt)).toBe(sha);
+    expect(existsSync(join(wt, "new.txt"))).toBe(true);
   });
 
   it("creates a worktree, commits, diffs, resets and removes it", async () => {

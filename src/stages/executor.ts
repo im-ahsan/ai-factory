@@ -172,22 +172,30 @@ export function earlierVersions(v: string): string[] {
 }
 
 /**
- * A step's hash for its inputs now, and whether it is already done: completed with the same inputs and model, under the current
- * template or an earlier one (only a change of inputs or model runs a completed step again).
+ * A step's hash for its inputs now, and whether it is already done: completed with the same inputs, under the current template
+ * or an earlier one. A completed step is checked with the model setting it ran with, so a run resumed after the setting changed
+ * does not pay for it again; only a change of inputs runs it again. (A run from before the setting was recorded has none: there
+ * a change of model still runs the step again.)
  */
 export function stepDone(state: RunState, step: Pick<StepDef, "key" | "templateVersion" | "coding">, inp: unknown, model: string | undefined): { hash: string; done: boolean } {
   const hashAt = (templateVersion: string) => inputsHash({ inputs: [JSON.stringify(inp)], stageDef: step.key, templateVersion, model, taskStartSha: step.coding ? String((inp as { taskStartSha?: string }).taskStartSha ?? "") : undefined });
   const hash = hashAt(step.templateVersion);
-  return { hash, done: earlierVersions(step.templateVersion).some((v) => canSkip(state, step.key, v === step.templateVersion ? hash : hashAt(v))) };
+  const ran = state.steps.get(step.key);
+  const ranWith = ran?.status === "completed" && ran.model !== undefined && ran.model !== model ? ran.model : undefined;
+  const hashRan = (templateVersion: string) => (ranWith === undefined ? hashAt(templateVersion) : inputsHash({ inputs: [JSON.stringify(inp)], stageDef: step.key, templateVersion, model: ranWith, taskStartSha: step.coding ? String((inp as { taskStartSha?: string }).taskStartSha ?? "") : undefined }));
+  return { hash, done: earlierVersions(step.templateVersion).some((v) => canSkip(state, step.key, hashRan(v))) };
 }
 
 /** A step's state now: undefined inputs when it isn't ready. */
 function pending(state: RunState, ledger: Ledger, project: ProjectConfig, step: StepDef): { inp?: Record<string, unknown>; hash: string; done: boolean } {
   const inp = step.inputs(state, ledger);
   if (!inp) return { hash: "", done: false };
-  let model: string | undefined;
-  try { model = routeFor(project, step.stage).model; } catch { model = undefined; }
-  return { inp, ...stepDone(state, step, inp, model) };
+  return { inp, ...stepDone(state, step, inp, routedModel(project, step)) };
+}
+
+/** The model setting a step's inputsHash is made with. */
+function routedModel(project: ProjectConfig, step: StepDef): string | undefined {
+  try { return routeFor(project, step.stage).model; } catch { return undefined; }
 }
 
 /** Pure: the first step whose recorded inputsHash doesn't match its current inputs. */
@@ -354,7 +362,7 @@ export async function execute(runId: string, echo: Log = () => undefined, opts: 
     if (share === 1) trace.setStep(step.key, attempt);
     const slog = (msg: string) => t.event("log", msg);
     let spent = 0;
-    await ledger.append({ type: "step.started", key, inputsHash: hash, data: { rung } }, writer);
+    await ledger.append({ type: "step.started", key, inputsHash: hash, data: { rung, model: routedModel(project, step) } }, writer);
     slog(`▶ ${step.key} (attempt ${attempt}${rung ? `, rung ${rung}` : ""})`);
 
     const ctx: StepContext = {

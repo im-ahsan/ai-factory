@@ -413,12 +413,6 @@ describe("brownfield slice end to end (fakes)", () => {
     const s = replay(ledger.events());
     expect(s.steps.get("implement/TASK-1")?.attempts).toBe(2);
     expect(s.steps.get("plan")?.attempts).toBe(1);
-
-    // a torn write at the end of the ledger is repaired on the next append
-    const { appendFileSync } = await import("node:fs");
-    appendFileSync(ledger.eventsPath, '{"seq":999,"ty');
-    await ledger.append({ type: "run.pause-requested" }, HUMAN_WRITER);
-    expect(ledger.events().some((e) => e.type === "ledger.repaired")).toBe(true);
   });
 
   it("parks, never swaps, when a step's model isn't in the policy's allowed models", async () => {

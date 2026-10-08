@@ -49,7 +49,7 @@ export function openRun(ref: string): Ledger {
     if (!runId) throw new Error(`${ref} holds no run folder (events.jsonl)`);
     return Ledger.open(runId, join(dir, runId));
   }
-  if (existsSync(join(ref, "events.jsonl"))) return Ledger.open(basename(ref), ref);
+  if (ref.includes("/") && Ledger.isRun(ref)) return Ledger.open(basename(ref), ref);
   return Ledger.open(ref);
 }
 

@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -52,19 +52,53 @@ describe("ledger", () => {
     expect(l.getJson(out)).toEqual({ a: 1 });
   });
 
-  it("repairs a torn last line before the next append", async () => {
+  it("keeps a home's events in its database, not in the run's file; two handles on one run never write the same seq", async () => {
     const l = await newRun();
+    const other = Ledger.open(l.runId);
+    await Promise.all([1, 2, 3, 4].map((i) => (i % 2 ? l : other).append({ type: "step.started", key: `intake/${i}` }, HUMAN_WRITER)));
+    expect(other.events().map((e) => e.seq)).toEqual([0, 1, 2, 3, 4]);
+    expect(readFileSync(l.eventsPath, "utf8")).toBe("");
+    expect(existsSync(join(process.env.FACTORY_HOME!, "factory.db"))).toBe(true);
+    expect(Ledger.listRuns()).toEqual([l.runId]);
+    expect(() => Ledger.create(l.runId)).toThrow(/already exists/);
+    // appendIf decides on the events as they are at the moment of writing
+    expect(await l.appendIf((evs) => (evs.length === 5 ? { type: "run.resumed" } : undefined), HUMAN_WRITER)).toMatchObject({ seq: 5 });
+    expect(await l.appendIf((evs) => (evs.length === 5 ? { type: "run.resumed" } : undefined), HUMAN_WRITER)).toBeUndefined();
+  });
+
+  it("a run from before the database is read into it once, and goes on from there; export writes it back out", async () => {
+    // an old run: a folder with events.jsonl, written as the file ledger wrote it
+    const old = Ledger.create("old-run", join(mkdtempSync(join(tmpdir(), "old-")), "old-run"));
+    await old.append({ type: "run.created", data: { mode: "brownfield", project: "p" } }, HUMAN_WRITER);
+    await old.append({ type: "step.started", key: "intake/1" }, HUMAN_WRITER);
+    const dir = join(process.env.FACTORY_HOME!, "ledger", "old-run");
+    cpSync(old.dir, dir, { recursive: true });
+    const text = readFileSync(join(dir, "events.jsonl"), "utf8");
+    expect(Ledger.listRuns()).toEqual(["old-run"]);
+    const l = Ledger.open("old-run");
+    expect(l.events()).toEqual(old.events());
+    await l.append({ type: "step.completed", key: "intake/1" }, HUMAN_WRITER);
+    expect(l.events().map((e) => [e.seq, e.type])).toEqual([[0, "run.created"], [1, "step.started"], [2, "step.completed"]]);
+    // the old file is left as it was, and is not read again
+    expect(readFileSync(join(dir, "events.jsonl"), "utf8")).toBe(text);
+    writeFileSync(join(dir, "events.jsonl"), "garbage\n");
+    expect(l.events()).toHaveLength(3);
+    // exported, the folder reads the same on a machine that has never seen the run
+    l.exportFile();
+    const there = join(mkdtempSync(join(tmpdir(), "home2-")), "ledger", "old-run");
+    cpSync(dir, there, { recursive: true });
+    expect(Ledger.open("old-run", there).events()).toEqual(l.events());
+  });
+
+  it("a run folder outside a home is an events file: a torn last line is repaired before the next append", async () => {
+    const l = Ledger.create("r", join(mkdtempSync(join(tmpdir(), "archive-")), "r"));
+    await l.append({ type: "run.created", data: { mode: "brownfield", project: "p" } }, HUMAN_WRITER);
     appendFileSync(l.eventsPath, '{"seq":1,"ts":"x","ru');
     expect(l.events()).toHaveLength(1);
     await l.append({ type: "step.started", key: "intake/1" }, HUMAN_WRITER);
     const evs = l.events();
     expect(evs.map((e) => e.type)).toEqual(["run.created", "ledger.repaired", "step.started"]);
     expect(readFileSync(l.eventsPath, "utf8").endsWith("\n")).toBe(true);
-  });
-
-  it("treats a bad line in the middle as corruption", async () => {
-    const l = await newRun();
-    await l.append({ type: "step.started", key: "intake/1" }, HUMAN_WRITER);
     const lines = readFileSync(l.eventsPath, "utf8").split("\n");
     writeFileSync(l.eventsPath, [lines[0], "garbage", lines[1], ""].join("\n"));
     expect(() => l.events()).toThrow(LedgerCorruptError);

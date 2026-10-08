@@ -23,6 +23,8 @@ export interface StepRecord {
   interruptions: number;
   lastAttempt: number;
   inputsHash?: string;
+  /** the model setting the last attempt's inputsHash was made with (absent on runs from before it was recorded) */
+  model?: string;
   outputs: string[];
   treeSha?: string;
   data?: Record<string, unknown>;
@@ -204,6 +206,7 @@ export function replay(events: LedgerEvent[]): RunState {
         r.status = "running";
         r.attempts += 1;
         r.lastAttempt = attempt;
+        r.model = (ev.data as { model?: string } | undefined)?.model;
         s.running = [...s.running.filter((x) => x.step !== step), { step, attempt, seq: ev.seq }];
         s.inFlight = s.running[s.running.length - 1];
         if (s.status !== "delivered") s.status = "running";

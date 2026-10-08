@@ -20,6 +20,11 @@ describe("template versions of a run in flight", () => {
     expect(stepDone(ranWith("2"), plan, inp, "m").done).toBe(true);
     expect(stepDone(ranWith("1"), plan, { spec: "t".repeat(64) }, "m").done).toBe(false);
     expect(stepDone(ranWith("1"), plan, inp, "other").done).toBe(false);
+    // a run that recorded the model setting its step ran with keeps the step done when the setting changes later
+    const recorded = ranWith("1");
+    (recorded.steps.get("plan") as { model?: string }).model = "m";
+    expect(stepDone(recorded, plan, inp, "other").done).toBe(true);
+    expect(stepDone(recorded, plan, { spec: "t".repeat(64) }, "other").done).toBe(false);
     // a run that has not done the step yet runs it under the new template
     const fresh = stepDone({ steps: new Map() } as unknown as RunState, plan, inp, "m");
     expect(fresh).toEqual({ done: false, hash: inputsHash({ inputs: [JSON.stringify(inp)], stageDef: "plan", templateVersion: "2", model: "m" }) });

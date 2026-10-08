@@ -541,7 +541,7 @@ With a GitHub `forge:`, the pull request title and the branch carry the ticket k
 | `factory edit-estimate <run> <hash> --anchor EST-1=6-12 --reason <text>` | Edits an estimate's anchors or ratios; recomputed in code, no model call, new card. Terminal only. |
 | `factory calibrate [--actual-hours <file>] [--decisions]` | Compares approved estimates with what the factory spent and, with a file of `estimate-run,actual-hours` lines, with real hours. `--decisions` prints each logged size pick paired with what its build took, one JSON line each (docs/estimate-consistency.md, section 11). Changes nothing. |
 | `factory calibrate --tune` / `--apply` / `--history` | After every estimate and build the factory proposes a tuned task catalogue in the background; nothing is sized from it until a person promotes it (docs/estimate-consistency.md, section 14). `--tune` shows what the tuning would change; `--apply` promotes it as a new version; `--history` lists the versions, why each changed, and a waiting proposal. |
-| `factory logs <run> [-f] [--step <key>]` | Prints a run's log; `-f` follows it. |
+| `factory logs <run> [-f] [--step <key>] [--events]` | Prints a run's log; `-f` follows it. `--events` writes the run's events to `events.jsonl` in its folder instead, for copying or archiving the folder. |
 | `factory report [run] [--all] [--json]` | Step scorecard for one run. Across runs (`--all`): outcome numbers first (delivered, cost per delivered change, time from request to branch, human stops, first-time pass), then a per-stage table. `--all --json` prints `{outcomes, stages}`. From the ledgers only, no AI. |
 | `factory design start "<requirements>" [--project <p>] [--ref <ref>]…` | Design only: clarifies the requirements, writes the spec and draws the design (mock, clickable demo, look) from them and any references, then stops at the design card. Nothing is sized or built. Takes `--file`, `--jira`, `--frames`, `--client`, `--project-name`, `--no-repo`, `--max-cost`. Without `--project` the design is for a new product. |
 | `factory design show <run> [--json]` | A run's design: stage (drafting, waiting for approval, approved), look, references with their colours and fonts, screens, and where the demo, screenshots and tokens are. Works on estimate runs too. |
@@ -628,7 +628,19 @@ By design it **can't approve plans**, and an MCP client can't answer questions. 
 | Git asks for a password (Windows) | GitHub needs a token, not your password. Re-run `install.ps1`; it connects Ubuntu's git to your Windows GitHub sign-in. |
 | Mac: builds are slow or run out of memory | `colima stop && colima start --cpu 6 --memory 12` |
 
-Everything a run did is in `~/.factory/ledger/<run>/` (`events.jsonl` plus content-addressed artifacts and cards).
+Everything a run did is kept on this machine:
+- **Events** (each step, decision, cost and gate result; a run's state and status are read from them) are in the
+  database `~/.factory/factory.db`.
+- **Files** (content-addressed artifacts, cards, traces, previews) are in `~/.factory/ledger/<run>/`.
+
+**Resuming later.** A run that is waiting on a card, parked or interrupted can be continued after any number of
+days with `factory resume <run>`. Finished steps are not run or paid for again, also when the factory was updated
+or a step's model setting changed in between. If the run's working folder was deleted, it is made again from the
+run's branch.
+
+**Copying or archiving a run.** Run `factory logs <run> --events` first. It writes the events to `events.jsonl` in
+the run's folder, so the folder is complete. A run folder copied into `~/.factory/ledger/` on another machine is
+read into that machine's database the first time it is opened. Runs from before the database are read in the same way.
 
 ---
 
