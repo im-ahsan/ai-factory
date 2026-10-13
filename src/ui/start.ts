@@ -75,6 +75,8 @@ export interface StartInput {
   uiTarget?: unknown;
   /** the models for this run, like --preset and --model: { preset?: "economy" | "balanced" | "quality", picks?: { step: model } } */
   models?: unknown;
+  /** a build: false starts it guided, true autonomous (like --guided / --autonomous); left out, the project decides */
+  autonomous?: unknown;
 }
 
 export interface StartDeps {
@@ -181,6 +183,8 @@ export async function startRun(input: StartInput, deps: StartDeps = {}): Promise
   if (input.github === true && !newProject) throw new StartError("Only a new product made now is put on GitHub: give its name and folder.");
   // an estimate and a design-only run both start from requirements: no project needed, frames allowed
   const estimating = input.mode === "estimate" || designing;
+  const autonomous = typeof input.autonomous === "boolean" ? input.autonomous : undefined;
+  if (autonomous !== undefined && estimating) throw new StartError("Guided or autonomous is chosen for a build; an estimate or design run has its own review.");
 
   // what the run starts from besides requirements: the same choices, and the same refusals, as the command line
   const fromDesignId = str(input.fromDesign)?.trim(), revisesId = str(input.revises)?.trim();
@@ -339,6 +343,7 @@ export async function startRun(input: StartInput, deps: StartDeps = {}): Promise
     ...(settings ? { mode: designing ? "design" as const : "estimate" as const, estimate: settings, attachments: req.attachments } : {}),
     ...(designExport ? { designExport } : {}),
     ...(uiTarget ? { uiTarget } : {}),
+    ...(autonomous !== undefined ? { autonomous } : {}),
     models,
   });
   if (!standalone) starting.set(project, { runId, at: Date.now() });

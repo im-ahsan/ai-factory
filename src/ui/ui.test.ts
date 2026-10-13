@@ -381,6 +381,24 @@ describe("factory ui: starting a run", () => {
     expect(started).toEqual([]);
   });
 
+  it("guided or autonomous is chosen at the start like --guided / --autonomous, and shows on the run", async () => {
+    const created = (runId: string) => Ledger.open(runId).events()[0]!.data as Record<string, unknown>;
+    const g = await post({ project: "web", prompt: "Rename the orders heading to Your orders", autonomous: false });
+    expect(g.status).toBe(201);
+    expect(created(g.json().runId).autonomous).toBe(false);
+    expect((await call(`/api/runs/${g.json().runId}`)).json().guided).toBe(true);
+    // left out, or anything but true or false: the project decides (autonomous unless its file says otherwise)
+    const d = await post({ project: "api", prompt: "Greet people with Hello instead of Hi", autonomous: "false" });
+    expect(created(d.json().runId)).not.toHaveProperty("autonomous");
+    expect((await call(`/api/runs/${d.json().runId}`)).json()).not.toHaveProperty("guided");
+    // an estimate or a design run has its own review
+    for (const mode of ["estimate", "design"]) {
+      const r = await post({ mode, project: "web", prompt: "Rename the orders heading to Your orders", autonomous: false });
+      expect(r.status).toBe(400);
+      expect(r.json().error).toMatch(/chosen for a build/);
+    }
+  });
+
   it("an uploaded PDF is read like --file", async () => {
     const r = await post({ project: "web", file: { name: "req.pdf", data: makePdf([["Rename the orders heading to Your orders."]]).toString("base64") } });
     expect(r.status).toBe(201);
@@ -566,6 +584,14 @@ describe("factory ui: a web app + API product (factory fullstack)", () => {
     expect(info.models).toEqual({ preset: "quality", picks: { implement: "claude-opus-5-5" } });
     expect(info.routes!.implement).toMatchObject({ model: "claude-opus-5-5", source: "pick" });
     expect(JSON.parse(readFileSync(join(process.env.FACTORY_HOME!, "fullstack", "orders.json"), "utf8")).models).toEqual({ preset: "quality", picks: { implement: "claude-opus-5-5" } });
+  });
+
+  it("a product started guided keeps the choice, so the API run is reviewed the same way", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "factory-ui-fs-"));
+    const r = await send("/api/fullstack", { name: "orders", dir, prompt: "An orders app: staff list orders and mark one shipped.", autonomous: false });
+    expect(r.status).toBe(201);
+    expect(replay(Ledger.open(r.json().webRun).events()).info.autonomous).toBe(false);
+    expect(JSON.parse(readFileSync(join(process.env.FACTORY_HOME!, "fullstack", "orders.json"), "utf8")).autonomous).toBe(false);
   });
 
   it("start, then the API run once the web plan is approved, then the run files once both are delivered", async () => {
@@ -1707,6 +1733,58 @@ describe("factory ui: design exports", () => {
     const accept = await call(`/api/runs/${l.runId}/fidelity/baseline`, { method: "POST", headers: { "Content-Type": "application/json", Origin: `http://127.0.0.1:${port}` }, body: JSON.stringify({ all: true, by: "lead", reason: "ok" }) });
     expect(accept.status).toBe(404);
     expect(Ledger.open(l.runId).events().some((e) => (e.data as { decision?: string } | undefined)?.decision === "accept-baseline")).toBe(false);
+  });
+});
+
+describe("factory ui: a guided run, in a browser", () => {
+  it.skipIf(!findChromium())("the start form sends the choice, and the understanding card is corrected on the run page with its detail folded", { timeout: 60_000 }, async () => {
+    const { chromium } = await import("playwright-core");
+    const browser = await chromium.launch({ executablePath: findChromium()!, args: ["--no-sandbox"] });
+    try {
+      const page = await browser.newPage();
+      const open = async (hash: string, sel: string) => { await page.goto(`http://127.0.0.1:${port}/?t=${TOKEN}${hash}`); await page.waitForSelector(sel); };
+      // the build form: Review is there, an estimate has none
+      await open("#/new/estimate", "#maxcost");
+      expect(await page.locator("#review").count()).toBe(0);
+      await open("#/new/brownfield", "#review");
+      expect(await page.locator("#review option").allTextContents()).toEqual(["Project default", expect.stringMatching(/^Autonomous/), expect.stringMatching(/^Guided/)]);
+      await page.selectOption("#project", "api");
+      await page.fill("#prompt", "Greet people with Hello instead of Hi");
+      await page.selectOption("#review", "false");
+      const before = Ledger.listRuns().length;
+      await page.click("button[type=submit]");
+      await page.waitForURL(/#\/runs\//);
+      expect(Ledger.listRuns().length).toBe(before + 1);
+      const runId = decodeURIComponent(page.url().split("#/runs/")[1]!);
+      const l = Ledger.open(runId);
+      expect((l.events()[0]!.data as { autonomous?: boolean }).autonomous).toBe(false);
+      await page.waitForSelector("text=guided");
+
+      // its "what I understood" card: no note field, the correction goes in as the send-back reason
+      const sha = "ab".repeat(32);
+      l.writeCard("understood-abababab", `# What I understood\n\n## What you asked for\n- greet with Hello\n\n## Decide\n  factory approve ${runId} <hash>\n\nCard hash: abababab`);
+      await l.append({ type: "human.requested", data: { cardId: "understood-abababab", kind: "understood", artifactSha: sha, step: "understood" } }, HUMAN_WRITER);
+      await open(`#/runs/${encodeURIComponent(runId)}`, "#d-reason");
+      expect(await page.locator(".card-box header strong").textContent()).toContain("Is this what you meant?");
+      expect(await page.locator("#d-note").count()).toBe(0);
+      await page.fill("#d-who", "Sam Lead");
+      await page.fill("#d-reason", "Admins keep Hi");
+      await page.click("text=Go on with this correction");
+      await page.waitForSelector("text=Recorded. The spec is being written with your correction");
+      expect(replay(l.events()).decisions.at(-1)).toMatchObject({ cardId: "understood-abababab", decision: "reject", by: "Sam Lead (via web)", reason: "Admins keep Hi" });
+
+      // the spec card: the plain part shows, the technical part is folded
+      const sha2 = "cd".repeat(32);
+      l.writeCard("spec-review-cdcdcdcd", `# The spec: what will be built\n\n## What will be built (1 requirement)\n- Greetings start with Hello.\n\n## Technical detail\n\n## Requirements\n- **REQ-1** (MODIFIED) hidden-until-opened\n\n## Decide\n  factory approve ${runId} <hash>\n\nCard hash: cdcdcdcd`);
+      await l.append({ type: "human.requested", data: { cardId: "spec-review-cdcdcdcd", kind: "spec-review", artifactSha: sha2, step: "spec-review" } }, HUMAN_WRITER);
+      await open(`#/runs/${encodeURIComponent(runId)}`, "text=Approve what will be built");
+      expect(await page.locator("text=Greetings start with Hello.").isVisible()).toBe(true);
+      expect(await page.locator("text=hidden-until-opened").isVisible()).toBe(false);
+      await page.click("summary:has-text('Technical detail')");
+      expect(await page.locator("text=hidden-until-opened").isVisible()).toBe(true);
+    } finally {
+      await browser.close();
+    }
   });
 });
 

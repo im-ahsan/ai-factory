@@ -27,6 +27,7 @@ import { databaseOf, loadProduct, productNames } from "../fullstack/product.js";
 import type { VisualCheck } from "../design/visual-check.js";
 import { exportWorkbooks } from "../estimate/export.js";
 import { humanReview } from "../estimate/settings.js";
+import { guided } from "../stages/framework.js";
 import { catalogueStatusText } from "../estimate/catalogue-status.js";
 import { deliveryTotals } from "../estimate/totals.js";
 import { exportInputFor } from "../stages/estimate-approve.js";
@@ -298,7 +299,7 @@ export function runView(ledger: Ledger) {
     .map((e) => ({ ts: e.ts, where: e.step ? `${e.step}${e.attempt ? `#${e.attempt}` : ""}` : "run", kind: e.kind, msg: e.msg }));
   return {
     runId: ledger.runId,
-    mode: s.info.mode,
+    mode: s.info.mode, ...(guided(s.info) ? { guided: true } : {}),
     project: s.info.project,
     // a repo to build in (a design or estimate made with no project has none)
     repo: !!s.info.repoPath && !!s.info.baseCommit,

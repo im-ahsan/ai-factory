@@ -519,6 +519,7 @@ async function requestScreen(kind = "brownfield", preset = []) {
   const modelsBlock = estimating ? sect(designing ? 7 : 8, "Models", "The model each step runs on.", h("div", { class: "fld" }, h("label", { for: "modelpreset" }, "Preset"), modelPreset), modelsTable, modelsHint)
     : h("div", { class: "field" }, h("label", { for: "modelpreset" }, "Models"), modelPreset, modelsTable, modelsHint);
   const maxCost = h("input", { type: "number", id: "maxcost", min: "0.5", step: "0.5", placeholder: "normal limit" });
+  const review = reviewChoice("review");
   // optional and rarely changed: folded, so the form reads as request, then start
   const moreOpts = h("details", { class: "more-opts" }, h("summary", {}, h("strong", {}, "More options"), h("span", { class: "hint" }, estimating ? "design references · export on approval" : "design references · export on approval · UI target")),
     refBlock, autoXBlock, uiTargetBlock);
@@ -544,6 +545,7 @@ async function requestScreen(kind = "brownfield", preset = []) {
     estimating ? sect(designing ? 8 : 9, "Cost", null, h("div", { class: "fld" }, h("label", { for: "maxcost" }, "Max cost (optional)"), h("div", { class: "money-in" }, h("span", {}, "$"), maxCost), h("div", { class: "hint" }, "It can only lower the normal limit, like --max-cost.")),
       h("div", { class: "opts" }, opt2("fresh", fresh, "Ask the model again", "Don't reuse answers stored from an identical earlier request (like --fresh). It costs more; use it when an answer should be redone.")))
       : h("div", { class: "field" }, h("label", { for: "maxcost" }, "Max cost (optional)"), h("div", { class: "money-in" }, h("span", {}, "$"), maxCost), h("div", { class: "hint" }, "It can only lower the normal limit, like --max-cost.")),
+    estimating ? null : h("div", { class: "field" }, h("label", { for: "review" }, "Review"), review.sel, h("div", { class: "hint" }, review.hint)),
     h("div", { class: "row" }, start, h("span", { class: "hint" }, designing ? "Runs in the background. Questions and the design approval can be answered here on the run page or in your terminal." : "Runs in the background. Questions, the design and the plan can be decided here on the run page or in your terminal; waivers and cost limits stay in the terminal.")),
   );
   // an estimate with the design left out has nothing to draw from or export: the frames, references and export blocks go
@@ -564,7 +566,7 @@ async function requestScreen(kind = "brownfield", preset = []) {
       const bf = buildFrom();
       const from = !estimating ? (bf.kind === "e" ? { fromEstimate: bf.id } : bf.kind === "d" ? { fromDesign: bf.id } : {})
         : startFrom.value && seedRun.value ? { [{ design: "fromDesign", revises: "revises" }[startFrom.value]]: seedRun.value } : {};
-      const body = { project: project.value, ...(designExport.length ? { designExport } : {}), ...from, ...(estimating && fresh.checked ? { fresh: true } : {}), ...(!estimating && uiTarget.value ? { uiTarget: uiTarget.value } : {}), ...modelsPicked(), prompt: seeded ? "" : prompt.value, ...(sent && !seeded ? { frames: sent } : {}), ...(sentRefs ? { refs: sentRefs } : {}), jira: jira.disabled || seeded ? "" : jira.value, maxCost: maxCost.value, ...(file && !seeded ? { file: file.data ? { name: file.name, data: file.data } : { name: file.name, text: file.text } } : {}),
+      const body = { project: project.value, ...(designExport.length ? { designExport } : {}), ...from, ...(estimating && fresh.checked ? { fresh: true } : {}), ...(!estimating && uiTarget.value ? { uiTarget: uiTarget.value } : {}), ...(estimating ? {} : review.picked()), ...modelsPicked(), prompt: seeded ? "" : prompt.value, ...(sent && !seeded ? { frames: sent } : {}), ...(sentRefs ? { refs: sentRefs } : {}), jira: jira.disabled || seeded ? "" : jira.value, maxCost: maxCost.value, ...(file && !seeded ? { file: file.data ? { name: file.name, data: file.data } : { name: file.name, text: file.text } } : {}),
         ...(designing ? { mode: "design", design: { noRepo: noRepo.checked, client: hdr.value, projectName: projName.value } } : estimating ? { mode: "estimate", estimate: { stackSource: stack.value, feedbackRounds: rounds.value, designInTotal: designIn.checked, ...(drawDesign.checked ? {} : { drawDesign: false }), noRepo: noRepo.checked, client: hdr.value, projectName: projName.value, pm: pm.value, ...(handsOff.checked ? { humanReview: false } : {}) } } : {}) };
       const r = await api("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       location.hash = `#/runs/${encodeURIComponent(r.runId)}`;
@@ -705,7 +707,7 @@ function runHeader(r, tab) {
     h("div", { class: "page-head" }, h("div", {},
       h("div", { class: "crumbs" }, h("a", { href: "#/runs" }, "Runs"), "/", h("span", { class: "mono" }, r.runId)),
       h("h1", {}, (r.request ?? "").split("\n").map((l) => l.replace(/^#+\s*/, "").trim()).find(Boolean) ?? r.runId),
-      h("div", { class: "meta" }, pill(r.status), h("span", {}, icon("layers"), r.project),
+      h("div", { class: "meta" }, pill(r.status), r.guided ? h("span", { title: "A person also checks what was understood and the spec" }, icon("shield"), "guided") : null, h("span", {}, icon("layers"), r.project),
         from ? h("span", {}, icon(kind === "jira" ? "ticket" : kind === "file" ? "file" : "pen"), from) : null,
         h("span", {}, icon("clock"), `started ${ago(r.createdAt)}`)))),
     h("nav", { class: "subnav", "aria-label": "Run views" },
@@ -961,7 +963,7 @@ function decisionForm(r, o) {
   no.addEventListener("click", () => send("reject"));
   return h("div", { class: "stack decide" },
     h("div", { class: "fld" }, h("label", { for: "d-who" }, "Your name"), who, h("div", { class: "hint" }, `Recorded with the decision as "your name (via web)", with card ${c.hash}.`)),
-    h("div", { class: "fld" }, h("label", { for: "d-note" }, o.noteLabel), note),
+    o.noteLabel ? h("div", { class: "fld" }, h("label", { for: "d-note" }, o.noteLabel), note) : null,
     h("div", { class: "row" }, ok),
     h("div", { class: "fld" }, h("label", { for: "d-reason" }, o.reasonLabel), reason, h("div", { class: "hint" }, o.reasonHint)),
     h("div", { class: "row" }, no),
@@ -1007,7 +1009,6 @@ const REVIEW_CARD_TEXT = {
     intro: "Read the card below: your request point by point, your answers, and what was assumed. Nothing is written yet, so a correction costs nothing; the run goes on either way.",
     form: {
       approveLabel: "This is right", rejectLabel: "Go on with this correction",
-      noteLabel: "Note (optional)", notePlaceholder: "",
       reasonLabel: "Or: what is wrong", reasonPlaceholder: "e.g. Receptionists must not see billing; only the clinic manager does.",
       reasonHint: "The spec is written with it. You are not asked again.", reasonNeeded: "Say what is wrong.",
       approved: "Recorded. The run is continuing…", rejected: "Recorded. The spec is being written with your correction…",
@@ -1025,6 +1026,13 @@ const REVIEW_CARD_TEXT = {
     },
   },
 };
+
+/** The guided / autonomous choice of a build's start form (like --guided / --autonomous): the select, and what goes in the POST body. */
+function reviewChoice(id) {
+  const sel = h("select", { id }, h("option", { value: "" }, "Project default"), h("option", { value: "true" }, "Autonomous: the factory decides, you approve the plan"), h("option", { value: "false" }, "Guided: you also check what was understood and the spec"));
+  const hint = "Guided adds two cards before the design and the plan, and plain summaries on top of the cards. The project default is autonomous unless its file sets autonomous: false. A run built from an approved estimate or design has its spec already: guided then adds only the summary on the plan card.";
+  return { sel, hint, picked: () => (sel.value ? { autonomous: sel.value === "true" } : {}) };
+}
 
 /** A card's text: a guided run's card has its plain summary first and its technical part folded. */
 function cardBody(c) {
@@ -2655,6 +2663,7 @@ async function greenfieldScreen(preset = []) {
     fileBox.replaceChildren(h("div", { class: "file-chip" }, icon("file"), h("span", { class: "mono" }, file.name), h("button", { class: "btn sm", type: "button", onclick: () => { file = undefined; fileInput.value = ""; fileBox.textContent = "Or upload a .md, .txt, .docx or .pdf file instead."; } }, icon("x"), "Remove")));
   });
   const maxCost = h("input", { type: "number", id: "fs-max", min: "0.5", step: "0.5", placeholder: "normal limit" });
+  const review = reviewChoice("fs-review");
   const start = h("button", { class: "btn primary", type: "submit" }, "Make the repos and start the web run", icon("arrow"));
   const fld = (id, label, control, hint) => h("div", { class: "field" }, h("label", { for: id }, label), control, hint ? (typeof hint === "string" ? h("div", { class: "hint" }, hint) : hint) : null);
   const reqBlock = h("div", { id: "fs-req" }, fld("fs-prompt", "Request", prompt),
@@ -2691,6 +2700,7 @@ async function greenfieldScreen(preset = []) {
     h("div", { class: "field" }, h("label", { for: "fs-from" }, "Start from (optional)"), fromSel, fromHint, warns),
     reqBlock,
     fld("fs-max", "Max cost of the web run (optional)", h("div", { class: "money-in" }, h("span", {}, "$"), maxCost), "It can only lower the normal limit, like --max-cost. With the API, the API run gets its own limit when you start it."),
+    fld("fs-review", "Review", review.sel, `${review.hint} With the API, the API run is reviewed the same way.`),
     h("details", { class: "more-opts" }, h("summary", {}, h("strong", {}, "Models"), h("span", { class: "hint" }, "the model each step runs on · defaults unless changed")), h("div", { class: "field" }, h("label", { for: "fs-models" }, "Preset"), picker.preset, picker.table, picker.hint)),
     h("div", { class: "row" }, start, h("span", { class: "hint" }, "Runs in the background. Decide the web run's cards on its run page.")));
   form.addEventListener("submit", async (ev) => {
@@ -2705,10 +2715,10 @@ async function greenfieldScreen(preset = []) {
       // the web app alone is a greenfield run into a new empty project, as factory init and factory start would make it
       if (webOnly()) {
         const r = await api("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode: "greenfield", project: "", newProject: { name: n, dir: d ? `${d}/${n}` : "" }, github: onGithub.checked, maxCost: maxCost.value, ...picker.picked(), ...from }) });
+          body: JSON.stringify({ mode: "greenfield", project: "", newProject: { name: n, dir: d ? `${d}/${n}` : "" }, github: onGithub.checked, maxCost: maxCost.value, ...review.picked(), ...picker.picked(), ...from }) });
         location.hash = `#/runs/${encodeURIComponent(r.runId)}`;
       } else {
-        const r = await api("/api/fullstack", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: n, dir: d, github: onGithub.checked, maxCost: maxCost.value, ...picker.picked(), ...from }) });
+        const r = await api("/api/fullstack", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: n, dir: d, github: onGithub.checked, maxCost: maxCost.value, ...review.picked(), ...picker.picked(), ...from }) });
         location.hash = `#/fullstack/${encodeURIComponent(r.name)}`;
       }
     } catch (e) {

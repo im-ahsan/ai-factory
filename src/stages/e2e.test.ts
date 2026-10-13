@@ -799,6 +799,42 @@ describe("a guided run: autonomous off (fakes)", () => {
     expect(modelCalls.length).toBeGreaterThan(before);
   });
 
+  it("a note on an approved understanding is only a note: the spec writers are handed nothing", async () => {
+    const { ledger, card } = await toUnderstood();
+    await decide(ledger, { decision: "approve", hashPrefix: card.artifactSha.slice(0, 8), by: "ahsan", data: { note: "looks good" } });
+    expect((await stop(ledger)).kind).toBe("spec-review");
+    expect(draftPrompt).not.toContain("looks good");
+    const s = replay(ledger.events());
+    expect(Object.keys(stepsFor(s).find((x) => x.key === "drafts")!.inputs(s, ledger)!)).toEqual(["intent", "cb", "c1", "c2"]);
+  });
+
+  it("a large request, read per module: one understanding card before any module's drafts, one spec card after the joined spec", async () => {
+    const file = join(process.env.FACTORY_HOME!, "projects", "demo.yaml");
+    writeFileSync(file, stringify({ ...parse(readFileSync(file, "utf8")), brownfield: { questions: true } }));
+    const part = (t: string) => `## ${t}\n\n${`Greet people with Hello instead of Hi in the ${t} area. `.repeat(250)}`;
+    const ledger = Ledger.open(await createRun(`${part("Orders")}\n\n${part("Billing")}`, "demo", "tester", { autonomous: false }));
+    const keys = stepsFor(replay(ledger.events())).map((x) => x.key);
+    expect(keys.filter((k) => k.startsWith("drafts"))).toEqual(["drafts:m1", "drafts:m2"]);
+    expect(keys.indexOf("understood")).toBe(keys.indexOf("drafts:m1") - 1);
+    expect(keys.indexOf("spec-review")).toBe(keys.indexOf("specify") + 1);
+    // every question card first, then the understanding card, with nothing drafted yet
+    let card = await stop(ledger);
+    for (let i = 0; i < 6 && card.kind === "question"; i++) {
+      await decide(ledger, { decision: "answer", hashPrefix: card.artifactSha.slice(0, 8), by: "ahsan", data: { answers: {} } });
+      card = await stop(ledger);
+    }
+    expect(card.kind).toBe("understood");
+    expect([...replay(ledger.events()).steps.keys()].some((k) => k.startsWith("drafts"))).toBe(false);
+    await answer(ledger, card, "reject", "Billing keeps Hi");
+    card = await stop(ledger);
+    expect(card.kind).toBe("spec-review");
+    expect(draftPrompt).toContain("Billing keeps Hi");
+    const s = replay(ledger.events());
+    expect(s.steps.get("specify:m1")!.status).toBe("completed");
+    expect(s.steps.get("specify:m2")!.status).toBe("completed");
+    expect(s.steps.has("impact")).toBe(false);
+  });
+
   it("the spec sent back is revised alone and shown again; the plan never sees the reason; a second time parks", async () => {
     const { ledger, card: u } = await toUnderstood();
     await answer(ledger, u, "approve");

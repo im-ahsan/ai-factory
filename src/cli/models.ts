@@ -106,3 +106,5 @@ export function autonomousOption(o: { guided?: boolean; autonomous?: boolean }):
   if (o.guided && o.autonomous) throw new Error("Use --guided or --autonomous, not both.");
   return o.guided ? false : o.autonomous ? true : undefined;
 }
+/** Said when a guided run starts from an approved estimate or design. */
+export const SEEDED_GUIDED_NOTE = "Guided: this run's spec was approved with the estimate or design it starts from, so it is not shown again; you get the plain summary on the plan card.";

@@ -33,7 +33,7 @@ import type { RequestSource } from "../sources/request.js";
 import { checkEdit, parseAnchorSpec, parseRatioSpec } from "../estimate/edits.js";
 import type { Proposal } from "../estimate/assemble.js";
 import { ESTIMATE_ROUTES } from "../stages/routing.js";
-import { AUTONOMOUS_HELP, autonomousOption, checkChoice, choiceOption, collectModel, GUIDED_HELP, MODEL_HELP, PRESET_HELP, registerModels } from "./models.js";
+import { AUTONOMOUS_HELP, autonomousOption, SEEDED_GUIDED_NOTE, checkChoice, choiceOption, collectModel, GUIDED_HELP, MODEL_HELP, PRESET_HELP, registerModels } from "./models.js";
 import { cardView } from "../stages/card-summary.js";
 import { findRuntimeBinary } from "../verify/runtime.js";
 import { factoryHome } from "../util/paths.js";
@@ -85,6 +85,7 @@ program.command("start")
   .description("create a run from a prompt, a file or a Jira ticket (any one, or several) and execute until a card, a park, or delivery")
   .action(async (prompt: string | undefined, o: { project: string; maxCost?: string; file?: string; jira?: string; fromEstimate?: string; fromDesign?: string; ref?: string[]; designExport?: string; uiTarget?: string; model?: string[]; preset?: string; guided?: boolean; autonomous?: boolean }) => {
     const autonomous = autonomousOption(o);
+    if (autonomous === false && (o.fromEstimate || o.fromDesign)) log(SEEDED_GUIDED_NOTE);
     const designExport = designExportOption(o.designExport);
     const uiTarget = uiTargetOption(o.uiTarget);
     const project = loadProject(o.project);

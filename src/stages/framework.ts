@@ -133,8 +133,5 @@ export const SPEC_CARD = "spec-review-";
 /** What a person sent back on the spec card (a guided run), oldest first. */
 export const specRejections = (state: RunState): string[] => rejectionsOf(state, SPEC_CARD);
 
-/** What a person corrected on the "what I understood" card (a guided run): handed to the spec writers. */
-export function correction(state: RunState): string | undefined {
-  const d = state.decisions.filter((x) => x.cardId.startsWith(UNDERSTOOD_CARD)).at(-1) as { note?: string; reason?: string } | undefined;
-  return String(d?.reason ?? d?.note ?? "").trim() || undefined;
-}
+/** What a person corrected on the "what I understood" card (a guided run): the reason it was sent back with, handed to the spec writers. An approval's note is only a note. */
+export const correction = (state: RunState): string | undefined => rejectionsOf(state, UNDERSTOOD_CARD).at(-1);
