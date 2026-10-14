@@ -26,8 +26,8 @@ import { S, think } from "./think.js";
 import { changeBase, ensureWorktree, toolsAt } from "./workspace.js";
 import { recordTestLesson } from "../context/lessons.js";
 import { followUpSection, readImpact } from "./impact.js";
-import { rewrittenTests, type Judged } from "./test-defect.js";
-import { contractLockFiles } from "./contract.js";
+import { disputedTests, openedFiles, rewrittenTests, type Disputed, type Judged } from "./test-defect.js";
+import { contractLockFiles, provedByApi, provenHere } from "./contract.js";
 import { isSettingsFile, newSettings, settingsSection, type SettingsNeeded } from "./outside-systems.js";
 
 /** Only a delivered run teaches the next one where its tests go; never fails delivery. */
@@ -146,7 +146,8 @@ export const reviewStep: StepDef = {
     };
   },
   async run(ctx) {
-    const spec = requireOutput<Spec>(ctx.state, ctx.ledger, "specify");
+    const specified = requireOutput<Spec>(ctx.state, ctx.ledger, "specify");
+    const spec = provenHere(ctx.project, specified);
     const head = gatedSha(ctx);
     // the review already written for this commit, when the step stopped on a card after it: read again, not paid for again
     const kept = keptReview(ctx, head);
@@ -158,7 +159,8 @@ export const reviewStep: StepDef = {
     /** a card raised from here on carries the review, so answering it does not buy a second one */
     const hold = (o: StepOutcome): StepOutcome => (o.kind === "wait"
       ? { ...o, card: { ...o.card, extra: { ...(o.card.extra ?? {}), reviewFor: head, reviewSha, familiesSha: fam, diffTruncated: truncated } } } : o);
-    const specSha = ctx.state.steps.get("specify")!.outputs[0]!;
+    // the criteria the gates hold this repo to (provenHere): the web side's share, stored for the gate record
+    const specSha = spec === specified ? ctx.state.steps.get("specify")!.outputs[0]! : ctx.ledger.putJson(spec);
     // completeness first: a review that skipped a criterion has not reviewed the change, so there
     // is nothing yet to judge. A fail, not a park — the ladder retries, raises effort, or uses a
     // stronger model, rather than asking a person to fix what the model should simply redo.
@@ -194,7 +196,9 @@ export const reviewStep: StepDef = {
     // a criterion the reviewer found no test for at all stops the run here: nothing proves it, and the tests are locked, so
     // a person accepts that by name or stops
     // (one a person accepted before the tests were locked is not asked about again)
-    const acceptedUntested = (ctx.state.steps.get("author-tests")?.data as { acceptedUntested?: string[] } | undefined)?.acceptedUntested ?? [];
+    // (and, in a lenient run, a criterion whose tests were all left out as wrong: already named on the PR as not proven)
+    const acceptedUntested = [...new Set([...((ctx.state.steps.get("author-tests")?.data as { acceptedUntested?: string[] } | undefined)?.acceptedUntested ?? []),
+      ...((ctx.state.steps.get("accept")?.data as { disputed?: string[] } | undefined)?.disputed ?? [])])];
     const proof = await runGate(criteriaHaveTests, ctx.ledger, ctx.writer, { review: reviewSha, spec: specSha, ...(acceptedUntested.length ? { accepted: ctx.ledger.putJson({ acIds: acceptedUntested }) } : {}) }, ctx.policy, { step: "review", treeSha: head });
     if (!proof.passed) {
       const w = buildWaiver(ctx, "review", [{ def: criteriaHaveTests, failures: proof.failures ?? [failure(criteriaHaveTests.id, proof.details)] }], head,
@@ -272,7 +276,7 @@ async function writeReview(ctx: StepContext, spec: Spec, head: string): Promise<
 // ---------- deliver ----------
 /** How a criterion's locked test proves it, in the PR text. */
 const PROOF: Record<string, string> = { unit: "unit test", api: "HTTP test + probe", job: "job test", ui: "screen test", manual: "manual" };
-export function prBody(ctx: Pick<StepContext, "state" | "runId">, a: { spec: Spec; plan: Plan; lock: { tests: { acId: string; testId: string }[]; familyNote?: string }; run: TestRun; review: { findings: { id: string; severity: string; text: string; category?: string; owasp?: string; file?: string; line?: number }[]; note?: string }; manifestHash: string; commits: string[]; rewritten?: Judged[]; settings?: SettingsNeeded[] }): string {
+export function prBody(ctx: Pick<StepContext, "state" | "runId">, a: { spec: Spec; plan: Plan; lock: { tests: { acId: string; testId: string }[]; familyNote?: string }; run: TestRun; review: { findings: { id: string; severity: string; text: string; category?: string; owasp?: string; file?: string; line?: number }[]; note?: string }; manifestHash: string; commits: string[]; disputed?: Disputed[]; rewritten?: Judged[]; opened?: ReturnType<typeof openedFiles>; settings?: SettingsNeeded[]; byApi?: string[] }): string {
   const flaky = a.run.results.filter((r) => r.flaky).map((r) => r.id);
   const security = a.review.findings.filter((f) => f.category === "security");
   // what a person decided at the review: the criteria tried by hand, and any check accepted as it stands
@@ -290,6 +294,7 @@ export function prBody(ctx: Pick<StepContext, "state" | "runId">, a: { spec: Spe
     ...a.spec.requirements.map((r) => `- **${r.id}** ${r.ears}\n${r.acceptance.map((c) => {
       const test = a.lock.tests.find((t) => t.acId === c.id)?.testId;
       return test ? `  - ${c.id} (${PROOF[c.level] ?? c.level}): \`${test}\``
+        : a.byApi?.includes(c.id) ? `  - ${c.id} (${PROOF[c.level] ?? c.level}): proven by the API side of this product, not in this repo`
         : byHand.has(c.id) ? `  - ${c.id}: checked by hand and signed off by ${reviewed!.manualChecks!.by} (no automated test)` : `  - ${c.id}: checked by a person (no automated test)`;
     }).join("\n")}`),
     ``,
@@ -307,7 +312,11 @@ export function prBody(ctx: Pick<StepContext, "state" | "runId">, a: { spec: Spe
     `- Acceptance tests were written first, failed on the old code twice, then locked`,
     ...(a.lock.familyNote ? [`- ⚠ ${a.lock.familyNote}`] : []),
     // a locked test the test-or-code check found wrong and rewrote during the build (test-defect.ts): a person should read it
+    // a lenient run (lenientTests): tests left out of the checks; a person reads each before merging
+    ...(a.disputed ?? []).map((d) => `- ⚠ **Not proven: locked test left out** \`${d.file}\` (${d.testId}, ${d.acId}) ${d.by ? `by ${d.by}, who disputed it` : `at ${d.step.replace(/^implement\//, "")}: a check judged the test wrong and it could not be put right`}: ${d.why} Check ${d.acId} by hand before merging.`),
     ...(a.rewritten ?? []).map((j) => `- ⚠ Locked test rewritten during the build: \`${j.file}\` (${j.testId}, ${j.acId}). It failed twice at ${j.step.replace(/^implement\//, "")} and a check judged the test wrong: ${j.why} The rewrite failed again on the code before that task, was read against its criterion, and was locked again. The factory does not merge this pull request itself: read the rewrite, then merge.`),
+    // a file of another task the check opened to a task so its locked test could pass: a change outside the plan's list for that task
+    ...(a.opened ?? []).map((o) => `- ⚠ File opened to another task during the build: \`${o.file}\` was changed by ${o.step.replace(/^implement\//, "")}, which the plan did not list it for. Its locked test ${o.testId} (${o.acId}) failed twice and a check judged the test right and the file list too narrow: ${o.why}`),
     ...(flaky.length ? [`- ⚠ Flaky (passed only on re-run): ${flaky.join(", ")}`] : []),
     ...(written?.waivers ?? []).map((w) => `- ⚠ Waived by ${w.human}: ${w.gateIds.join(", ")} (${w.reason})${written?.acceptedUntested?.length ? `. No test covers ${written.acceptedUntested.join(", ")}` : ""}`),
     ...(reviewed?.waivers ?? []).map((w) => `- ⚠ Waived by ${w.human}: ${w.gateIds.join(", ")} (${w.reason})`),
@@ -478,7 +487,8 @@ export const deliverStep: StepDef = {
 
     const spec = requireOutput<Spec>(ctx.state, ctx.ledger, "specify");
     const plan = requireOutput<Plan>(ctx.state, ctx.ledger, "plan");
-    const body = prBody(ctx, { spec, plan, lock, run: requireOutput<TestRun>(ctx.state, ctx.ledger, "integrate"), review: requireOutput(ctx.state, ctx.ledger, "review"), manifestHash, commits, rewritten: rewrittenTests(ctx.ledger.events()), settings: await settingsNeeded(wt, changeBase(ctx.state), gated) })
+    const byApi = spec.requirements.flatMap((r) => r.acceptance.filter((c) => provedByApi(ctx.project, c)).map((c) => c.id));
+    const body = prBody(ctx, { spec, plan, lock, byApi, run: requireOutput<TestRun>(ctx.state, ctx.ledger, "integrate"), review: requireOutput(ctx.state, ctx.ledger, "review"), manifestHash, commits, rewritten: rewrittenTests(ctx.ledger.events()), disputed: disputedTests(ctx.ledger.events()), opened: openedFiles(ctx.ledger.events()), settings: await settingsNeeded(wt, changeBase(ctx.state), gated) })
       + followUpSection(readImpact(ctx.state, ctx.ledger));
     const jiraKey = ctx.state.info.sources?.find((s) => s.kind === "jira")?.key;
     const title = `${jiraKey ? `${jiraKey}: ` : "factory: "}${spec.requirements[0]?.ears.slice(0, 60) ?? ctx.runId}`;

@@ -2,13 +2,13 @@
 // copy → install (npm registry only, through the feed proxy, no install scripts) → build (no network) → vitest (no network)
 // → stop everything → read the JSON report. Accept starts the built app (npm start, or vite preview) and sends the probes.
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import type { BuildRun, TestResult } from "../contracts/index.js";
 import { sha256 } from "../util/hash.js";
 import { factoryHome } from "../util/paths.js";
 import { FEED_PROXY_URL, FEEDS_NET } from "../runners/netinfra.js";
-import { copyTree, hostUser, splitCurl, type AcceptResult, type ProduceInput, type ProduceOutput } from "./dotnet.js";
+import { copyDir, copyTree, hostUser, LOG_KEPT, saveBuild, splitCurl, type AcceptResult, type ProduceInput, type ProduceOutput } from "./dotnet.js";
 import { type ContainerSpec, stopAndRemove } from "./runtime.js";
 import { buildTestRun, markFlaky, rerunCandidates, type Expectations } from "./validate.js";
 import { isLoadError, loadFailures, parseVitestJson, titleOf, titlePattern } from "./vitest.js";
@@ -50,6 +50,9 @@ export function parseNodeBuildErrors(log: string): BuildRun["errors"] {
   return out;
 }
 
+/** More test files than this are not left out one by one: the command line would not hold them. */
+const MAX_SKIP_FILES = 400;
+
 export async function produceNodeTests(inp: ProduceInput): Promise<ProduceOutput> {
   const { rt, project } = inp;
   if (project.database) throw new Error("A test database is not available for Node projects yet: remove database: from the project config.");
@@ -77,14 +80,35 @@ export async function produceNodeTests(inp: ProduceInput): Promise<ProduceOutput
   try {
     const t0 = Date.now();
     const toolVersions: Record<string, string> = { nodeImage: await rt.imageDigest(project.node.image) };
+    // an earlier lab run in this run already installed and built this exact commit: start from a copy of it (the new tests are
+    // run twice on one commit, and each run paid for npm install and the build again: run 1679, 47 seconds a time)
+    const cached = !inp.restoreOnly && inp.buildCache ? join(inp.buildCache, sha256(JSON.stringify([inp.commit, project.node.image])).slice(0, 24)) : undefined;
+    const reuse = !!cached && existsSync(cached);
+    if (reuse) {
+      copyDir(cached!, src);
+      utimesSync(cached!, new Date(), new Date()); // most recently used: pruned last
+      phase("build-reused", `lab: reused the install and build of ${inp.commit.slice(0, 10)} from an earlier lab run (${secs(t0)})`);
+    }
+    if (!reuse) {
     copyTree(inp.repo, inp.commit, src);
     phase("copy", `lab: copied ${inp.commit.slice(0, 10)} (${secs(t0)})`);
     if (!existsSync(join(src, "package.json"))) {
       return failedRun({ kind: "build", ok: false, errors: [{ file: "package.json", line: 0, code: "NO-APP", msg: "the repo has no package.json at its root" }] }, toolVersions);
     }
 
-    // install: only the npm registry, through the feed proxy; install scripts never run
+    // install: only the npm registry, through the feed proxy; install scripts never run. Package files this run already
+    // installed (every task keeps them: run ae5c installed the same packages 13 times, 35 to 48 s each) are copied in instead.
     const tInstall = Date.now();
+    const installed = !inp.restoreOnly && inp.buildCache ? join(inp.buildCache, "installs", sha256(JSON.stringify([packageFilesKey(src), project.node.image])).slice(0, 24)) : undefined;
+    if (installed && existsSync(join(installed, "node_modules"))) {
+      try {
+        copyDir(join(installed, "node_modules"), join(src, "node_modules"));
+        utimesSync(installed, new Date(), new Date());
+        phase("restore", `lab: reused the npm install of these package files (${secs(tInstall)})`);
+      } catch { rmSync(join(src, "node_modules"), { recursive: true, force: true }); }
+    }
+    const fresh = !existsSync(join(src, "node_modules"));
+    if (fresh) {
     const r = await launch({
       role: "restore", image: project.node.image, network: FEEDS_NET, workdir: "/src",
       env: { ...NODE_ENV, HTTPS_PROXY: FEED_PROXY_URL, HTTP_PROXY: FEED_PROXY_URL },
@@ -92,11 +116,13 @@ export async function produceNodeTests(inp: ProduceInput): Promise<ProduceOutput
     });
     const rCode = await rt.wait(r, project.node.buildTimeoutSec * 1000);
     logs.restore = await rt.logs(r);
-    phase("restore", `lab: npm install ${rCode === 0 ? "ok" : `FAILED (exit ${rCode ?? "timeout"})`} (${secs(tInstall)})`, rCode === 0 ? undefined : { logTail: logs.restore.split("\n").slice(-40).join("\n") });
+    phase("restore", `lab: npm install ${rCode === 0 ? "ok" : `FAILED (exit ${rCode ?? "timeout"})`} (${secs(tInstall)})`, rCode === 0 ? undefined : { logTail: logs.restore.slice(-LOG_KEPT) });
     await finish(r);
     const installFailed: BuildRun = { kind: "build", ok: false, errors: [{ file: "package.json", line: 0, code: "RESTORE", msg: `npm install failed (exit ${rCode ?? "timeout"})` }] };
     if (inp.restoreOnly) return failedRun(rCode === 0 ? { kind: "build", ok: true, errors: [] } : installFailed, toolVersions, rCode === 0 ? 0 : 1);
     if (rCode !== 0) return failedRun(installFailed, toolVersions);
+    if (installed) saveInstall(join(src, "node_modules"), installed);
+    }
 
     // build, no network (a package with no build script builds nothing)
     const tBuild = Date.now();
@@ -105,12 +131,17 @@ export async function produceNodeTests(inp: ProduceInput): Promise<ProduceOutput
     await rt.stop(b);
     logs.build = await rt.logs(b);
     await finish(b);
-    phase("build", `lab: build ${bCode === 0 ? "ok" : `FAILED (exit ${bCode ?? "timeout"})`} (${secs(tBuild)})`, bCode === 0 ? undefined : { logTail: logs.build.split("\n").slice(-40).join("\n") });
+    phase("build", `lab: build ${bCode === 0 ? "ok" : `FAILED (exit ${bCode ?? "timeout"})`} (${secs(tBuild)})`, bCode === 0 ? undefined : { logTail: logs.build.slice(-LOG_KEPT) });
     if (bCode !== 0) {
       const errors = parseNodeBuildErrors(logs.build);
       return failedRun({ kind: "build", ok: false, errors: errors.length ? errors : [{ file: "", line: 0, code: "BUILD", msg: `npm run build failed (exit ${bCode ?? "timeout"}): ${logs.build.split("\n").filter(Boolean).slice(-3).join(" ").slice(0, 400)}` }] }, toolVersions);
     }
+    if (cached) saveBuild(src, inp.buildCache!, cached);
+    }
     const build: BuildRun = { kind: "build", ok: true, errors: [] };
+    if (inp.buildOnly) {
+      return { testRun: { ...buildTestRun({ treeSha: inp.commit, stage: inp.stage, toolVersions, exp: inp.exp, raw: { reports: [], results: [], discovered: [], exitCode: 0 }, probeOk: () => true }), runner: "vitest" }, build, reports: [], logs };
+    }
 
     let accept: AcceptResult | undefined;
     if (inp.accept) {
@@ -120,12 +151,15 @@ export async function produceNodeTests(inp: ProduceInput): Promise<ProduceOutput
       for (const p of accept.probes) phase("probe", `lab: probe ${p.method} ${p.path} → ${p.status} (expected ${p.expectStatus})`);
     }
 
+    // a task's full run leaves out the test files that hold only tests of tasks not built yet
+    const later = inp.skipLater?.files.length && inp.skipLater.files.length <= MAX_SKIP_FILES ? inp.skipLater.files : [];
+    if (later.length && !inp.filterExpr && !inp.onlyTests?.length) phase("skip", `lab: skipping ${later.length} test file(s) of tasks that are not built yet`);
     const runTests = async (pattern: string | undefined, resultsDir: string) => {
       const started = Date.now();
       const t = await launch({
-        role: "producer", image: project.node.image, network: "none", workdir: "/src", env: NODE_ENV,
+        role: "producer", image: project.node.image, network: "none", workdir: "/src", env: { ...NODE_ENV, ...inp.testEnv },
         mounts: [{ src, dst: "/src" }, { src: cache, dst: "/npm-cache", ro: true }, { src: resultsDir, dst: "/results" }],
-        cmd: ["npx", "--no-install", "vitest", "run", "--reporter=json", "--outputFile=/results/r.json", "--passWithNoTests", ...(pattern ? ["-t", pattern] : [])],
+        cmd: ["npx", "--no-install", "vitest", "run", "--reporter=json", "--outputFile=/results/r.json", "--passWithNoTests", ...(inp.shuffle ? ["--sequence.shuffle"] : []), ...(pattern ? ["-t", pattern] : later.flatMap((f) => ["--exclude", f]))],
       });
       const code = await rt.wait(t, project.node.testTimeoutSec * 1000);
       await rt.stop(t);
@@ -153,7 +187,8 @@ export async function produceNodeTests(inp: ProduceInput): Promise<ProduceOutput
       first.reports.length && !fileErrors.length ? undefined : { logTail: logs.test.split("\n").slice(-40).join("\n") });
 
     const exp: Expectations = inp.resolveExp ? inp.resolveExp(results) : inp.exp;
-    const again = rerunCandidates(results, exp, inp.knownFailures).filter((id) => !isLoadError(id));
+    // (a later task's locked test in a file that had to run is not worth a second run: it fails until that task is built)
+    const again = rerunCandidates(results, exp, new Set([...(inp.knownFailures ?? []), ...(inp.skipLater?.ids ?? [])])).filter((id) => !isLoadError(id));
     if (again.length && again.length <= 20) {
       const dir = join(work, "results-rerun");
       mkdirSync(dir, { recursive: true });
@@ -236,4 +271,29 @@ async function bootAndProbe(
     },
     probes,
   };
+}
+
+/** The package files an install is made from: the same text, the same node_modules. */
+export function packageFilesKey(dir: string): string {
+  const read = (f: string) => (existsSync(join(dir, f)) ? readFileSync(join(dir, f), "utf8") : "");
+  return sha256(`package.json\n${read("package.json")}\npackage-lock.json\n${read("package-lock.json")}`);
+}
+
+/** Save a good install under its package files' key (written to a side folder first, so a half copy is never reused). */
+function saveInstall(nodeModules: string, dest: string): void {
+  if (existsSync(dest)) return;
+  const tmp = `${dest}.partial-${randomBytes(3).toString("hex")}`;
+  try {
+    copyDir(nodeModules, join(tmp, "node_modules"));
+    renameSync(tmp, dest);
+    pruneInstalls(join(dest, ".."), 2);
+  } catch { rmSync(tmp, { recursive: true, force: true }); }
+}
+
+/** Keep the `keep` most recently used saved installs of a run; a task that changes the package files makes a new one. */
+function pruneInstalls(dir: string, keep: number): void {
+  try {
+    const all = readdirSync(dir).map((n) => join(dir, n)).filter((p) => !p.includes(".partial-")).sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    for (const old of all.slice(keep)) rmSync(old, { recursive: true, force: true });
+  } catch { /* a saved install that cannot be pruned only costs disk */ }
 }

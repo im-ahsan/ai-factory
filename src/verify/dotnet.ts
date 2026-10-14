@@ -21,6 +21,9 @@ import { parseTrx } from "./trx.js";
 import { parseBuildWarnings } from "./warnings.js";
 import { buildTestRun, type Expectations, markFlaky, needsProbe, rerunCandidates } from "./validate.js";
 
+/** How much of a failed restore or build log the ledger keeps (characters, from the end): in practice all of it. */
+export const LOG_KEPT = 1_000_000;
+
 export interface ProduceInput {
   runId: string;
   key: string;                 // step key, for container labels
@@ -35,6 +38,10 @@ export interface ProduceInput {
   onRemoved?: (id: string) => Promise<void>;
   /** For author-tests-on-base: only run these tests. */
   onlyTests?: string[];
+  /** extra environment for the test run only (the environment check moves the test instant: FACTORY_TEST_NOW) */
+  testEnv?: Record<string, string>;
+  /** run the tests in a random order (the environment check) */
+  shuffle?: boolean;
   /** tests that failed in the baseline: never re-run as possibly flaky */
   knownFailures?: ReadonlySet<string>;
   /** Per-run package folder, kept between producer runs (restore is the slow part). */
@@ -54,12 +61,19 @@ export interface ProduceInput {
   buildCache?: string;
   /** Test IDs not to run on a full-suite run: the repo's known failures, which can never block anything. */
   skipTests?: string[];
+  /**
+   * Locked tests of tasks that are not built yet, left out of a task's full-suite run: they cannot pass and nothing reads their
+   * result there. By test ID (.NET), and the test files that hold nothing else (Node, where a run leaves out whole files).
+   */
+  skipLater?: { ids: string[]; files: string[] };
   /** Read what the built app's database has even when the commit has no approved data model (the untouched repo, before a plan). */
   readSchema?: boolean;
   /** Stop once the database was read: no accept, no tests. For a baseline whose tests are already on record. */
   schemaOnly?: boolean;
   /** Only restore packages into packagesDir (for the coding container); no build or tests. */
   restoreOnly?: boolean;
+  /** Stop once the commit is built: no database, no accept, no tests. For the plan's stubs, which only have to compile. */
+  buildOnly?: boolean;
   /** Accept: boot the app in the db's namespace and send these probes before the tests run. */
   accept?: { probes: Probe[] };
   /** For the run trace: one call per finished phase. */
@@ -219,7 +233,7 @@ export function buildCachePath(dir: string, commit: string, project: ProjectConf
 export const KEEP_BUILDS = 2;
 
 /** Copy a folder's contents: a cheap clone where the file system supports it, a plain copy otherwise. */
-function copyDir(from: string, to: string): void {
+export function copyDir(from: string, to: string): void {
   mkdirSync(to, { recursive: true });
   const clone = process.platform === "darwin" ? ["-c", "-a"] : ["-a", "--reflink=auto"];
   try {
@@ -306,11 +320,11 @@ export async function produceDotnetTests(inp: ProduceInput): Promise<ProduceOutp
         mounts: [{ src, dst: "/src" }, { src: nuget, dst: "/nuget" }], cmd: ["dotnet", "restore", ...sln],
       });
       const rCode = await rt.wait(r, project.dotnet.buildTimeoutSec * 1000);
-      phase("restore", `lab: restore ${rCode === 0 ? "ok" : `FAILED (exit ${rCode ?? "timeout"})`} (${secs(tRestore)})`, rCode === 0 ? undefined : { logTail: (await rt.logs(r)).split("\n").slice(-40).join("\n") });
+      phase("restore", `lab: restore ${rCode === 0 ? "ok" : `FAILED (exit ${rCode ?? "timeout"})`} (${secs(tRestore)})`, rCode === 0 ? undefined : { logTail: (await rt.logs(r)).slice(-LOG_KEPT) });
       logs.restore = await rt.logs(r);
       await finish(r);
       // a backend with EF Core migrations: fetch the tool that runs them, once per packages folder, for the schema read below
-      const ef = rCode === 0 && !inp.restoreOnly && wantsSchema() && !migrateConfigured(project) ? efMigrations(src) : undefined;
+      const ef = rCode === 0 && !inp.restoreOnly && !inp.buildOnly && wantsSchema() && !migrateConfigured(project) ? efMigrations(src) : undefined;
       if (ef && !existsSync(join(nuget, EF_TOOLS, "dotnet-ef"))) {
         const t = await launch({
           role: "restore", image: project.dotnet.sdkImage, network: FEEDS_NET, workdir: "/src",
@@ -336,15 +350,17 @@ export async function produceDotnetTests(inp: ProduceInput): Promise<ProduceOutp
         });
         const tBuild = Date.now();
         const bCode = await rt.wait(b, project.dotnet.buildTimeoutSec * 1000);
-        phase("build", `lab: build ${bCode === 0 ? "ok" : `FAILED (exit ${bCode ?? "timeout"})`} (${secs(tBuild)})`);
+        const builtIn = secs(tBuild);
         await rt.stop(b); // stop before read
         logs.build = await rt.logs(b);
+        // a failed build keeps its whole output in the ledger: the parsed errors are what the next attempt is told, the log is the proof
+        phase("build", `lab: build ${bCode === 0 ? "ok" : `FAILED (exit ${bCode ?? "timeout"})`} (${builtIn})`, bCode === 0 ? undefined : { logTail: logs.build.slice(-LOG_KEPT) });
         await finish(b);
         build = { kind: "build", ok: bCode === 0, errors: parseBuildErrors(logs.build) };
         lint = { kind: "lint", tool: "dotnet-build", version: toolVersions["dotnet"] ?? "unknown", findings: parseBuildWarnings(logs.build) };
         // a backend with an approved data model: start the app once so it creates its database, and keep what the database has
         // (a backend on PostgreSQL is read further down, once its database server is up)
-        if (build.ok && !project.database && wantsSchema()) {
+        if (build.ok && !inp.buildOnly && !project.database && wantsSchema()) {
           const tSchema = Date.now();
           const built = schema = await readBuiltSchema(inp, src, nuget, launch, finish);
           mkdirSync(join(src, BUILT_SCHEMA_FILE, ".."), { recursive: true });
@@ -365,6 +381,7 @@ export async function produceDotnetTests(inp: ProduceInput): Promise<ProduceOutp
       });
       return { testRun, build, lint, reports: [], logs };
     }
+    if (inp.buildOnly) return { testRun: noTests(), build, lint, reports: [], logs };
     // nothing more to read for a backend on SQLite: skip the database server and the tests
     if (inp.schemaOnly && !project.database) return { testRun: noTests(), build, lint, reports: [], logs, schema };
 
@@ -438,9 +455,13 @@ export async function produceDotnetTests(inp: ProduceInput): Promise<ProduceOutp
 
     // a full-suite run skips the repo's known failures (every expected test still runs)
     const targeted = inp.filterExpr ?? (inp.onlyTests?.length ? filterFor(inp.onlyTests) : undefined);
-    const skipFilter = targeted || !inp.skipTests?.length ? undefined : skipFilterFor(inp.skipTests);
-    const skipped = skipFilter ? inp.skipTests! : [];
-    if (skipFilter) phase("skip", `lab: skipping ${skipped.length} test(s) that already fail on the base branch`);
+    // and a task's run leaves out the tests of tasks not built yet; where both make the filter too long, the known failures alone
+    const later = targeted ? [] : inp.skipLater?.ids ?? [];
+    const both = !targeted && later.length ? skipFilterFor([...(inp.skipTests ?? []), ...later]) : undefined;
+    const skipFilter = both ?? (targeted || !inp.skipTests?.length ? undefined : skipFilterFor(inp.skipTests));
+    const skipped = skipFilter ? inp.skipTests ?? [] : [];
+    if (both) phase("skip", `lab: skipping ${later.length} locked test(s) of tasks that are not built yet`);
+    if (skipFilter && skipped.length) phase("skip", `lab: skipping ${skipped.length} test(s) that already fail on the base branch`);
     else if (!targeted && inp.skipTests?.length) phase("skip", `lab: running the known failures too: the filter to skip ${inp.skipTests.length} test(s) would be too long`);
     const filter = targeted ?? skipFilter;
     const tTests = Date.now();
@@ -457,7 +478,8 @@ export async function produceDotnetTests(inp: ProduceInput): Promise<ProduceOutp
     if (dbId && needsProbe(results)) probe = (await rt.exec(dbId, ["pg_isready", "-h", "127.0.0.1"])).code === 0;
 
     const exp = inp.resolveExp ? inp.resolveExp(results) : inp.exp;
-    const again = rerunCandidates(results, exp, inp.knownFailures);
+    // (a later task's locked test that ran all the same is not worth a second run: it fails until that task is built)
+    const again = rerunCandidates(results, exp, new Set([...(inp.knownFailures ?? []), ...(inp.skipLater?.ids ?? [])]));
     if (again.length && again.length <= 20 && probe) {
       const dir = join(work, "results-rerun");
       mkdirSync(dir, { recursive: true });

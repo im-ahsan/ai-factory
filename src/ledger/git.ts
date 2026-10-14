@@ -213,6 +213,33 @@ export async function commitWith(wt: string, base: string, files: string[], mess
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
+/**
+ * A commit of `base` with these files added or replaced, made from their text alone: no checkout is touched. The plan's stubs
+ * are built in the test lab this way before there is a worktree.
+ */
+export async function commitFiles(repo: string, base: string, files: { path: string; content: string }[], message: string): Promise<string> {
+  const dir = mkdtempSync(join(tmpdir(), "factory-index-"));
+  try {
+    const env = { GIT_INDEX_FILE: join(dir, "index") };
+    await git(repo, ["read-tree", base], { env });
+    for (const f of files) {
+      writeFileSync(join(dir, "blob"), f.content);
+      const blob = (await git(repo, ["hash-object", "-w", "--no-filters", "--", join(dir, "blob")])).stdout.trim();
+      await git(repo, ["update-index", "--add", "--cacheinfo", `100644,${blob},${f.path}`], { env });
+    }
+    const tree = (await git(repo, ["write-tree"], { env })).stdout.trim();
+    return (await git(repo, ["commit-tree", tree, "-p", base, "-m", message])).stdout.trim();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+/**
+ * Remove the ignored files (build output), but not the paths in `keep`. With -X an "-e <path>" is one more ignore rule, so it
+ * would remove the path too: "-e !<path>" un-ignores it. Run ae5c: every kept retry deleted node_modules and reinstalled it.
+ */
+export async function cleanIgnored(wt: string, keep: string[] = []): Promise<void> {
+  await git(wt, ["clean", "-fdX", ...keep.flatMap((k) => ["-e", `!${k}`])]);
+}
+
 export async function resetHard(wt: string, sha: string, keep: string[] = []): Promise<void> {
   await git(wt, ["reset", "--hard", sha]);
   await git(wt, ["clean", "-fdx", ...keep.flatMap((k) => ["-e", k])]);

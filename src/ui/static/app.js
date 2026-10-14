@@ -796,7 +796,7 @@ function modelsPanel(r) {
     h("div", { class: "panel-head" }, h("h2", {}, icon("gauge"), "Models"), h("span", { class: "small muted" }, head)),
     m.saved ? h("table", { class: "models used" }, th("Step", "Model", "From", "Calls", "Cost"), h("tbody", {}, m.rows.map((x) => {
       const a = spent.get(x.step);
-      return h("tr", {}, h("td", { class: "mono" }, x.step), h("td", {}, x.name, h("span", { class: "faint small" }, ` ${x.effort}`)), h("td", { class: "small" }, x.source === "pick" && !x.preset ? h("span", { class: "chip" }, "chosen") : from(x)),
+      return h("tr", {}, h("td", { class: "mono" }, x.step), h("td", {}, x.source === "off" ? h("span", { class: "faint" }, x.name) : [x.name, h("span", { class: "faint small" }, ` ${x.effort}`)]), h("td", { class: "small" }, x.source === "pick" && !x.preset ? h("span", { class: "chip" }, "chosen") : x.source === "off" ? "not picked" : from(x)),
         h("td", { class: "num" }, a ? String(a.calls) : ""), h("td", { class: "num" }, a ? money(a.usd) : ""));
     })))
       : h("p", { class: "small muted" }, "This run began before the models were saved with a run: it uses the routing table of that time."),
@@ -1656,7 +1656,7 @@ function dataModelScreen(id) {
 const TEST_STATE = {
   proven: ["ok", "Proven"], weak: ["bad", "Weak test"], "no-test": ["bad", "No test"],
   passing: ["ok", "Passing"], failing: ["bad", "Failing"], flaky: ["wait", "Flaky"],
-  locked: ["wait", "Locked, not run yet"], "not-written": ["idle", "No test yet"],
+  locked: ["wait", "Locked, not run yet"], "not-written": ["idle", "No test yet"], "api-side": ["idle", "Proven by the API"],
   "by-hand": ["wait", "Needs a check by hand"], signed: ["ok", "Signed off"], "failed-by-hand": ["bad", "Failed by hand"],
 };
 const TEST_LEVEL = { unit: "unit test", api: "HTTP test", job: "job test", ui: "screen test", manual: "by hand" };
@@ -2560,12 +2560,13 @@ function modelPicker(catalogue, id, also = "") {
     const plannerLabel = planner ? h("span", { class: "faint small", hidden: true }, " planned by ") : null;
     const row = h("tr", {}, h("td", { class: "mono" }, s.step), h("td", { class: "faint small" }, s.group),
       h("td", {}, s.fixed ? h("span", {}, `${mName(s.model)} `, h("span", { class: "faint small" }, "always")) : pick, plannerLabel, planner, " ", tag, note));
-    // the model the row would run on, and whether a person moved it off its default (a pick, or a preset)
-    const on = () => (pick && pick.value) || (preset.value ? s.presets[preset.value] : s.model);
-    const moved = () => !!((pick && pick.value) || preset.value);
+    // the model the row would run on, and whether that is another model than its default (a pick, or a preset)
+    // a step that is off until picked (the critic) runs on nothing, and a preset does not turn it on
+    const on = () => (pick && pick.value) || (s.off ? "" : preset.value ? s.presets[preset.value] : s.model);
+    const moved = () => !!on() && on() !== s.model;
     const sync = () => {
       if (!pick) return;
-      auto.textContent = `${mName(preset.value ? s.presets[preset.value] : s.model)} (${preset.value || "default"})`;
+      auto.textContent = s.off ? "Off (default)" : `${mName(preset.value ? s.presets[preset.value] : s.model)} (${preset.value || "default"})`;
       tag.hidden = !pick.value;
       const engine = (s.engines ?? []).find((e) => e.id === pick.value);
       if (planner) {
@@ -2574,7 +2575,7 @@ function modelPicker(catalogue, id, also = "") {
       }
       // a spec step on the model its critic runs on: allowed, and said here as the start check says it
       const other = s.apart ? rows.find((r) => r.step === s.apart) : undefined;
-      const same = !!other && on() === other.on() && (moved() || other.moved());
+      const same = !!other && !!on() && on() === other.on() && (moved() || other.moved());
       note.hidden = !engine && !same;
       if (!note.hidden) note.textContent = engine ? engine.note : `the ${other.step} is ${mName(on())} too, so it reads a spec its own model wrote`;
     };
@@ -2591,7 +2592,7 @@ function modelPicker(catalogue, id, also = "") {
     const picks = Object.fromEntries(rows.filter((r) => r.pick?.value).map((r) => [r.step, r.value()]));
     return preset.value || Object.keys(picks).length ? { models: { ...(preset.value ? { preset: preset.value } : {}), ...(Object.keys(picks).length ? { picks } : {}) } } : {};
   };
-  const hint = h("div", { class: "hint" }, `Chosen once, here: the run keeps these to the end. ${also}A preset fills every step from the tier table; change any step by hand and it is marked. A retry that keeps failing moves a step one model up. Like --preset and --model. `,
+  const hint = h("div", { class: "hint" }, `Chosen once, here: the run keeps these to the end. ${also}A preset fills every step from the tier table; change any step by hand and it is marked. The critic is off unless you pick a model for it. A retry that keeps failing moves a step one model up. Like --preset and --model. `,
     catalogue.models.map((m) => `${m.name} $${m.input}/$${m.output}${m.unconfirmed ? " (not confirmed)" : ""}`).join(" · "), " per million tokens in/out.");
   return { preset, table: h("table", { class: "models" }, h("tbody", {}, rows.map((r) => r.row))), hint, picked };
 }
@@ -2631,12 +2632,17 @@ async function greenfieldScreen(preset = []) {
   const estimates = (meta.estimates ?? []).filter((e) => !e.repo), designs = (meta.designs ?? []).filter((d) => !d.repo);
   const why = (e) => (webOnly() ? e.cannotBuildWebOnly : e.cannotBuild);
   const fromSel = h("select", { id: "fs-from" });
+  // the design step is skipped by building something already approved: the scaffold, the pages and the API client all come from it
+  const canSkip = designs.length + estimates.length > 0;
+  const skipDesign = h("input", { type: "checkbox", id: "fs-skip-design", disabled: !canSkip });
+  const fromField = h("div", { class: "field" }, h("label", { for: "fs-from" }, "Build from"), fromSel);
+  const from = () => (skipDesign.checked ? fromSel.value : "");
   const warns = h("div");
   const fillFrom = () => {
     const keep = fromSel.value;
-    fromSel.replaceChildren(h("option", { value: "" }, "Nothing: describe the product, and the run draws its design"),
+    fromSel.replaceChildren(h("option", { value: "" }, "Choose an approved design or estimate"),
       designs.length ? h("optgroup", { label: "Approved designs (the design steps are skipped)" }, designs.map((d) => h("option", { value: `d:${d.runId}` }, `${d.runId}  ·  ${d.request}`))) : null,
-      estimates.length ? h("optgroup", { label: "Approved estimates (the web run is held to it)" }, estimates.map((e) => h("option", { value: `e:${e.runId}`, disabled: !!why(e), ...(why(e) ? { title: why(e) } : {}) }, `${e.runId}  ·  ${e.request}${why(e) ? "  (not all of it would be built: see below)" : ""}`))) : null);
+      estimates.length ? h("optgroup", { label: "Approved estimates (the web run is held to it)" }, estimates.map((e) => h("option", { value: `e:${e.runId}`, disabled: !!why(e), ...(why(e) ? { title: why(e) } : {}) }, `${e.runId}  ·  ${e.request}${why(e) ? "  (not all of it would be built: see below)" : e.noDesign ? "  (made with no design: the run draws one)" : ""}`))) : null);
     if ([...fromSel.options].some((o) => o.value === keep && !o.disabled)) fromSel.value = keep;
     warns.replaceChildren(...estimates.filter(why).map((e) => h("div", { class: "hint warn-text" }, icon("alert"), " ", why(e))));
   };
@@ -2661,9 +2667,13 @@ async function greenfieldScreen(preset = []) {
     h("div", { class: "field" }, h("label", { class: "drop slim", for: "fs-file" }, fileInput, icon("upload"), h("strong", {}, "Choose a requirements file")), fileBox));
   // an approved design or estimate brings its own request
   const syncFrom = () => {
-    const k = fromSel.value.slice(0, 1);
-    reqBlock.hidden = !!k;
-    fromHint.textContent = k === "d" ? "Its request and approved design carry over: the web run asks no design questions and draws nothing again. No estimate is made."
+    const k = from().slice(0, 1);
+    fromField.hidden = !skipDesign.checked;
+    warns.hidden = !skipDesign.checked;
+    reqBlock.hidden = skipDesign.checked;
+    fromHint.textContent = !canSkip ? "Nothing to build from yet: no design or estimate made with no repo has been approved. The web run draws the design for you to approve."
+      : skipDesign.checked && !k ? "Choose the approved design or estimate to build. Its request carries over, so there is nothing to describe."
+      : k === "d" ? "Its request and approved design carry over: the web run asks no design questions and draws nothing again. No estimate is made."
       : k === "e" ? (webOnly() ? "Its request, spec, design and tasks carry over: the web run is held to the estimate's scope and budget."
         : "Its request, spec, design and tasks carry over: the web run is held to the estimate's scope and budget, and the backend tasks go to the API run, which builds the approved contract (it is not held to the estimate).")
       : "The web run asks its questions and draws the design for you to approve. No estimate is made.";
@@ -2677,10 +2687,11 @@ async function greenfieldScreen(preset = []) {
   };
   backend.addEventListener("change", syncBackend);
   fromSel.addEventListener("change", syncFrom);
+  skipDesign.addEventListener("change", syncFrom);
   fillFrom();
   if (["design", "estimate"].includes(preset[0]) && preset[1]) {
     const v = `${preset[0] === "design" ? "d" : "e"}:${preset[1]}`;
-    if ([...fromSel.options].some((o) => o.value === v && !o.disabled)) fromSel.value = v;
+    if ([...fromSel.options].some((o) => o.value === v && !o.disabled)) { fromSel.value = v; skipDesign.checked = true; }
   }
   syncBackend();
   const form = h("form", { class: "form", novalidate: true }, err,
@@ -2688,7 +2699,9 @@ async function greenfieldScreen(preset = []) {
     fld("fs-name", "Product name", name, "Lower-case letters, digits and dashes. It names the project (with the API: <name>-web and <name>-api)."),
     fld("fs-dir", "Folder for the repos", dir, repos),
     h("div", { class: "field" }, h("label", { class: "opt", for: "fs-github" }, onGithub, h("span", {}, h("strong", {}, "Put it on GitHub"), ghText))),
-    h("div", { class: "field" }, h("label", { for: "fs-from" }, "Start from (optional)"), fromSel, fromHint, warns),
+    h("div", { class: "field" }, h("label", { class: "opt", for: "fs-skip-design" }, skipDesign, h("span", {}, h("strong", {}, "Skip the design step"), h("span", { class: "hint" }, "Build a design that is already approved; nothing is drawn and no design card is shown.")))),
+    fromField,
+    h("div", { class: "field" }, fromHint, warns),
     reqBlock,
     fld("fs-max", "Max cost of the web run (optional)", h("div", { class: "money-in" }, h("span", {}, "$"), maxCost), "It can only lower the normal limit, like --max-cost. With the API, the API run gets its own limit when you start it."),
     h("details", { class: "more-opts" }, h("summary", {}, h("strong", {}, "Models"), h("span", { class: "hint" }, "the model each step runs on · defaults unless changed")), h("div", { class: "field" }, h("label", { for: "fs-models" }, "Preset"), picker.preset, picker.table, picker.hint)),
@@ -2698,17 +2711,18 @@ async function greenfieldScreen(preset = []) {
     err.hidden = true;
     start.disabled = true;
     start.replaceChildren(h("span", { class: "spin" }), webOnly() ? "Making the repo…" : "Making the repos…");
-    const k = fromSel.value.slice(0, 1), id = fromSel.value.slice(2);
-    const from = k === "d" ? { fromDesign: id } : k === "e" ? { fromEstimate: id } : file ? { file } : { prompt: prompt.value };
+    const k = from().slice(0, 1), id = from().slice(2);
+    if (skipDesign.checked && !k) { fail("Choose the approved design or estimate to build, or turn Skip the design step off."); start.disabled = false; syncBackend(); return; }
+    const seed = k === "d" ? { fromDesign: id } : k === "e" ? { fromEstimate: id } : file ? { file } : { prompt: prompt.value };
     const n = name.value.trim(), d = dir.value.trim().replace(/\/+$/, "");
     try {
       // the web app alone is a greenfield run into a new empty project, as factory init and factory start would make it
       if (webOnly()) {
         const r = await api("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode: "greenfield", project: "", newProject: { name: n, dir: d ? `${d}/${n}` : "" }, github: onGithub.checked, maxCost: maxCost.value, ...picker.picked(), ...from }) });
+          body: JSON.stringify({ mode: "greenfield", project: "", newProject: { name: n, dir: d ? `${d}/${n}` : "" }, github: onGithub.checked, maxCost: maxCost.value, ...picker.picked(), ...seed }) });
         location.hash = `#/runs/${encodeURIComponent(r.runId)}`;
       } else {
-        const r = await api("/api/fullstack", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: n, dir: d, github: onGithub.checked, maxCost: maxCost.value, ...picker.picked(), ...from }) });
+        const r = await api("/api/fullstack", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: n, dir: d, github: onGithub.checked, maxCost: maxCost.value, ...picker.picked(), ...seed }) });
         location.hash = `#/fullstack/${encodeURIComponent(r.name)}`;
       }
     } catch (e) {

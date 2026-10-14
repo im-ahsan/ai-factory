@@ -1,7 +1,10 @@
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { failure } from "../gates/engine.js";
 import type { LedgerEvent } from "../contracts/index.js";
-import { coversIntegrate, usesEmptyBaseline, keepPassingTests, earlierTests, labelRegressions, previousAttempt, patchLines, retryMode, checkOf, limitsNote, TEST_SCOPE, testRetryMode, testWriterTampering, labelRejectionLifted, rewriteHasRoom } from "./build.js";
+import { coversIntegrate, usesEmptyBaseline, keepPassingTests, earlierTests, labelRegressions, previousAttempt, patchLines, retryMode, checkOf, limitsNote, TEST_SCOPE, testRetryMode, writerGroups, proofGroups, testKitFacts, writerScope, inTests, shownFailures, proofNamed, testWriterTampering, labelRejectionLifted, rewriteHasRoom, laterTests } from "./build.js";
 import { ProjectConfig } from "../config/project.js";
 import { DEFAULT_POLICY } from "../gates/policy.js";
 import { attemptSpend, startNeed } from "./executor.js";
@@ -49,7 +52,7 @@ describe("retry: keep the previous attempt's code or reset", () => {
     expect(mode(["regression"], 3, { rung: 2 })).toBe("keep");
     expect(mode(["build", "locked-failed"], 1)).toBe("keep");
     expect(retryMode(prev(["agent-error"]), 1).mode).toBe("reset");
-    expect(retryMode(prev(["locked-failed", "secret"]), 1).mode).toBe("reset");
+    expect(retryMode(prev(["locked-failed", "lock-set"]), 1).mode).toBe("reset");
     expect(retryMode(prev([]), 1)).toEqual({ mode: "reset", reason: "moved from rung 0 to rung 1" });
   });
 
@@ -68,7 +71,7 @@ describe("retry: keep the previous attempt's code or reset", () => {
     expect(at(["locked-failed"], 20, 20).mode).toBe("keep");
     expect(at(["locked-failed"], 4).mode).toBe("keep");
     expect(at(["locked-failed", "build"], 4, 20).mode).toBe("keep");
-    expect(at(["locked-failed", "secret"], 4, 20).mode).toBe("reset");
+    expect(at(["locked-failed", "lock-set"], 4, 20).mode).toBe("reset");
   });
 
   it("keeps the code of an attempt that stopped when the model account ran out of credit", () => {
@@ -100,10 +103,30 @@ describe("retry: keep the previous attempt's code or reset", () => {
   });
 
   it("resets after safety, scope, escape hatches, agent errors and bad evidence", () => {
-    for (const c of ["lock-set", "config-integrity", "secret", "diff-in-scope", "escape-hatch", "agent-timeout", "agent-error", "exception", "evidence", "locked-not-executed", "expected-fail-passed"]) {
+    for (const c of ["lock-set", "config-integrity", "diff-in-scope", "escape-hatch", "agent-timeout", "agent-error", "exception", "evidence", "locked-not-executed", "expected-fail-passed"]) {
       expect(mode(["locked-failed", c]), c).toBe("reset");
     }
-    expect(retryMode(prev(["locked-failed", "secret"]), 0).reason).toBe("the previous attempt failed on secret");
+    expect(retryMode(prev(["locked-failed", "lock-set"]), 0).reason).toBe("the previous attempt failed on lock-set");
+  });
+
+  it("keeps after a difference from the locked contract or data model (run e8ef: 15 passing tests were written again)", () => {
+    expect(mode(["contract"])).toBe("keep");
+    expect(mode(["contract", "data-model", "locked-failed"], 1)).toBe("keep");
+    expect(mode(["contract", "lock-set"])).toBe("reset");
+  });
+
+  it("keeps after a flagged secret or a design lint finding, also when it parked the run", () => {
+    expect(mode(["secret"])).toBe("keep");
+    expect(mode(["design-fidelity", "secret"], 1)).toBe("keep");
+    expect(retryMode(prev(["design-fidelity"]), 0).reason).toBe("the previous attempt failed only on design-fidelity");
+    let seq = 0;
+    const ev = (data: Record<string, unknown>) => [{ seq: seq++, ts: "", runId: "r", epoch: 0, type: "step.failed", key: "implement/TASK-1/1", data }] as LedgerEvent[];
+    const parked = (checks: string[], data: Record<string, unknown> = { commit: "abc" }) => retryMode(previousAttempt(ev({ rung: 0, parked: true, ...data }), "implement/TASK-1", checks)!, 0).mode;
+    expect(parked(["secret", "design-fidelity"])).toBe("keep");
+    // parked on anything else, with another check beside it, or with no commit to go back to: start clean
+    expect(parked(["locked-failed"])).toBe("reset");
+    expect(parked(["secret", "diff-in-scope"])).toBe("reset");
+    expect(parked(["secret"], {})).toBe("reset");
   });
 
   it("resets after an interrupted attempt, and on the first attempt", () => {
@@ -295,5 +318,92 @@ describe("a weak test goes back to its writer only while the ladder has somewher
     expect(rewriteHasRoom(ctx({ rung: 0, attempt: DEFAULT_POLICY.retryBudget - 1 }))).toBe(true);
     expect(rewriteHasRoom(ctx({ rung: 0, attempt: DEFAULT_POLICY.retryBudget }))).toBe(false);
     expect(rewriteHasRoom(ctx({ rung: 0, attempt: DEFAULT_POLICY.retryBudget, extra: 2 }))).toBe(true);
+  });
+});
+
+describe("test writing: parallel writers and the lighter test check", () => {
+  const acs = (sizes: number[]) => sizes.flatMap((n, r) => Array.from({ length: n }, (_, i) => ({ id: `AC-${r + 1}.${i + 1}`, req: `REQ-${r + 1}` })));
+  it("keeps a short list with one writer and splits a long one by whole requirements", () => {
+    expect(writerGroups(acs([3, 4, 5]))).toHaveLength(1);
+    expect(writerGroups([])).toEqual([]);
+    const g = writerGroups(acs([5, 5, 5, 5, 5, 5]));
+    expect(g.map((x) => x.length)).toEqual([10, 10, 10]);
+    expect(g.flat()).toEqual(acs([5, 5, 5, 5, 5, 5]).map((a) => a.id));
+    // 85 criteria in 17 screens: four writers at most, no requirement cut in two
+    const big = writerGroups(acs(Array(17).fill(5)));
+    expect(big).toHaveLength(4);
+    expect(big.flat()).toHaveLength(85);
+    for (const grp of big) expect(new Set(grp.map((id) => id.split(".")[0])).size * 5).toBe(grp.length);
+    // one requirement holding everything cannot be split
+    expect(writerGroups(acs([40]))).toHaveLength(1);
+  });
+  it("gives each writer one file of its own, inside the tests", () => {
+    expect(matchesAny("tests/acceptance.part2.test.tsx", writerScope(2))).toBe(true);
+    expect(matchesAny("App.Tests/AcceptancePart2Tests.cs", writerScope(2))).toBe(true);
+    expect(matchesAny("App.Tests/AcceptancePart3Tests.cs", writerScope(2))).toBe(false);
+    expect(matchesAny("App.Tests/HealthTests.cs", writerScope(1))).toBe(false);
+  });
+  it("tells a build error in the tests from one in code the writer may not change", () => {
+    expect(inTests("App.Tests/OrderTests.cs")).toBe(true);
+    expect(inTests("/src/App.Tests/OrderTests.cs")).toBe(true);
+    expect(inTests("/work/tests/a.test.tsx")).toBe(true);
+    expect(inTests("App.Api/Orders/IOrderStore.cs")).toBe(false);
+  });
+  it("shows every test-check finding and reads only the named criteria again", () => {
+    const proof = Array.from({ length: 37 }, (_, i) => ({ check: "test-proof", message: `AC-${i + 1}.1: its test does not prove the criterion (x).` }));
+    const compile = Array.from({ length: 30 }, () => ({ check: "tests-compile", message: "a.cs:1 CS0246 x" }));
+    expect(shownFailures([...compile, ...proof]).filter((f) => f.check === "test-proof")).toHaveLength(37);
+    expect(shownFailures([...compile, ...proof]).filter((f) => f.check === "tests-compile")).toHaveLength(20);
+    expect(proofNamed([...proof.slice(0, 2), proof[0]!, compile[0]!])).toEqual(["AC-1.1", "AC-2.1"]);
+  });
+});
+
+describe("a task's run leaves out the tests of tasks not built yet", () => {
+  const lock = {
+    tests: [{ testId: "t1", file: "tests/a.test.ts" }, { testId: "t2", file: "tests/a.test.ts" }, { testId: "t3", file: "tests/b.test.ts" }, { testId: "t4", file: "tests/old.test.ts" }],
+    characterisation: [{ testId: "c1", file: "tests/c.test.ts" }],
+  };
+  it("by test: every locked test the task does not expect; by file: only a file that holds nothing it expects and no test of the code base", () => {
+    // t2 shares a file with t1, which this task must pass: the file runs; old.test.ts also holds a test of the code base
+    expect(laterTests(lock, ["t1", "c1"], ["tests/old.test.ts > was here"])).toEqual({ ids: ["t2", "t3", "t4"], files: ["tests/b.test.ts"] });
+    expect(laterTests(lock, ["t1", "c1"])).toEqual({ ids: ["t2", "t3", "t4"], files: ["tests/b.test.ts", "tests/old.test.ts"] });
+  });
+  it("the last task leaves nothing out, so integrate can reuse its run", () => {
+    expect(laterTests(lock, ["t1", "t2", "t3", "t4", "c1"])).toEqual({ ids: [], files: [] });
+  });
+});
+
+describe("the test check's readers and the writers' test kit", () => {
+  it("reads the test files side by side: one group a file, four at most, a criterion with no test in the first", () => {
+    const t = (file: string, ...acs: string[]) => acs.map((acId) => ({ acId, file }));
+    const need = (...ids: string[]) => ids.map((id) => ({ id }));
+    // one file: one reader, as before
+    expect(proofGroups(need("AC-1.1", "AC-1.2"), t("a.test.ts", "AC-1.1", "AC-1.2"))).toEqual([{ need: need("AC-1.1", "AC-1.2"), tests: t("a.test.ts", "AC-1.1", "AC-1.2") }]);
+    const two = proofGroups(need("AC-1.1", "AC-2.1", "AC-9.9"), [...t("a.test.ts", "AC-1.1"), ...t("b.test.ts", "AC-2.1")]);
+    expect(two.map((g) => g.need.map((a) => a.id))).toEqual([["AC-1.1", "AC-9.9"], ["AC-2.1"]]);
+    // six files, four readers: every criterion is read once
+    const files = ["a", "b", "c", "d", "e", "f"].flatMap((f, i) => t(`${f}.test.ts`, `AC-${i + 1}.1`));
+    const six = proofGroups(files.map((x) => ({ id: x.acId })), files);
+    expect(six).toHaveLength(4);
+    expect(six.flatMap((g) => g.need.map((a) => a.id)).sort()).toEqual(files.map((x) => x.acId).sort());
+    // nothing to read: no reader
+    expect(proofGroups([], [])).toEqual([]);
+  });
+
+  it("hands the writer the support files, the screens and the handler names; nothing where the checkout has none", () => {
+    const wt = mkdtempSync(join(tmpdir(), "factory-kit-"));
+    expect(testKitFacts(wt)).toBeUndefined();
+    for (const d of ["tests/support", "components/screens/s-2", "components/screens/s-10", "lib/api"]) mkdirSync(join(wt, d), { recursive: true });
+    writeFileSync(join(wt, "tests/support/screen.ts"), "export function at(path: string): void {}\n");
+    writeFileSync(join(wt, "components/screens/s-2/container.tsx"), "");
+    writeFileSync(join(wt, "components/screens/s-10/container.tsx"), "");
+    writeFileSync(join(wt, "lib/api/client.msw.ts"), "export const getGetOrdersResponseMock = () => [];\nexport const getGetOrdersMockHandler = () => 0;\nconst hidden = 1;\n");
+    const k = testKitFacts(wt)!;
+    expect(k).toContain("tests/support/screen.ts (as it is");
+    expect(k).toContain("export function at(path: string): void {}");
+    expect(k).toContain("container.tsx: s-2, s-10.");
+    expect(k).toContain("getGetOrdersResponseMock, getGetOrdersMockHandler.");
+    expect(k).not.toContain("hidden");
+    expect(testKitFacts(wt, 40)).toMatch(/… \(cut; read the files for the rest\)$/);
   });
 });

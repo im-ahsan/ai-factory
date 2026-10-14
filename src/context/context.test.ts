@@ -40,6 +40,43 @@ public class OrderSync
 `;
 
 describe("secrets", () => {
+  it("does not take a sign-in form's own code for a secret, and still reports a literal (run 1679)", () => {
+    for (const line of [
+      "const response = await signIn({ email: normalizedEmail, password: passphrase });",
+      "writeSession({ accessToken: response.data.accessToken, ...response.data.user });",
+      "  accessToken: string;",
+      "<PasswordField password={password} onChange={setPassword} />",
+      "const schema = z.object({ password: z.string().min(8) });",
+      "var request = new SignIn { Password = model.Password };",
+    ]) expect(scanText(line.includes("var ") ? "a.cs" : "a.tsx", line), line).toEqual([]);
+    // the lines of run 1679's sign-in screen and session file that the scan reported or could have, as the three attempts wrote them
+    for (const line of [
+      '  accessToken: "demo-token-01",',
+      'const fixtureError = "Invalid email or password.";',
+      '    const password = String(formData.get("password") ?? "");',
+      '    const nextFieldErrors: { email?: string; password?: string } = {};',
+      '    if (!password) nextFieldErrors.password = "Password is required.";',
+      "      const response = await signIn({ email, password });",
+      "        password: response.data.fieldErrors?.password,",
+      '                  type="password"',
+      '    const credential = fields.get("password");',
+      "      writeSession({ ...response.data.user, accessToken: response.data.accessToken });",
+      '                <Input id="password" name="password" type="password" autoComplete="current-password" required />',
+      "export type SessionState = SessionUser & { accessToken: string };",
+      '    setPassphraseError(missingPassphrase ? "Enter your password." : "");',
+      '      setPassphraseError(fieldErrors?.password ?? "");',
+      "  accessToken?: string;",
+    ]) expect(scanText(line.includes("SessionState") || line.includes("accessToken?") ? "lib/auth/session.ts" : "components/screens/s-1/container.tsx", line), line).toEqual([]);
+    // a literal that is neither sample data nor a message is still a secret, in a screen too
+    expect(scanText("components/screens/s-1/container.tsx", '  accessToken: "9f8a7c6b5d4e3f2a",').map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.tsx", "errors.password = 'hunter2222 ';").map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.yaml", 'password: "demo-token-01"').map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.ts", 'const password = "hunter2222";').map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.ts", "const conn = `Host=db.example.com;Password=hunter2222`;").map((h) => h.rule)).toEqual(["password-assignment"]);
+    // outside source files nothing changes: a bare value in a config file is a secret
+    expect(scanText(".env", "PASSWORD=hunter2222").map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.yaml", "password: hunter2222").map((h) => h.rule)).toEqual(["password-assignment"]);
+  });
   it("does not report the password of a database on this machine, and still reports any other (run e1b5)", () => {
     expect(scanText("a.cs", "const string c = \"Host=127.0.0.1;Port=1;Database=x;Username=nobody;Password=nobody;Timeout=3\";")).toEqual([]);
     expect(scanText("a.json", "\"App\": \"Server=localhost;Database=x;Password=postgres1\"")).toEqual([]);
