@@ -21,8 +21,8 @@ export function dependencyKind(stack: Stack): string {
   return stack === "node" ? "npm" : "NuGet";
 }
 
-/** The stacks whose lab can run a test of a screen: a "ui" criterion stays one there, and is a person's check elsewhere. */
-export const testsScreens = (stack: Stack): boolean => stack === "node";
+/** The projects that test screens: a web app with screen tests turned on (the project's `screenTests`). A "ui" criterion stays one there, and is a person's check elsewhere. */
+export const testsScreens = (project: { stack: Stack; screenTests?: boolean; contract?: unknown }): boolean => project.stack === "node" && (project.screenTests ?? !!project.contract);
 
 const SCREEN_TEST_RULES = `- A "ui" criterion gets a screen test: a tests/*.test.tsx file whose FIRST line is "// @vitest-environment jsdom". Render the screen's container (components/screens/<s-id>/container.tsx, the page with its data and behaviour) with render() from "@testing-library/react", and act as a person does with userEvent from "@testing-library/user-event".
 - Assert what a person sees and can do: find things by role and name (screen.getByRole("button", { name: "Save" })), by label (getByLabelText) or by the words on the page, never by class name, test id or component internals. Use findBy... for what appears after data loads.
@@ -49,7 +49,8 @@ Rules:
 - New APIs exist as stubs that throw new Error("not implemented"); tests must import them and fail for now.
 - Also write characterisation tests for existing behaviour next to the change that must NOT change; those must pass today. A new app has little of its own: write none when there is nothing to keep.
 - Don't change production code, package.json, tsconfig or the vitest config.
-- You may run "npx tsc --noEmit" to check the tests compile. Don't run the tests: the factory runs them itself in its test lab.
+- Every test runs at a fixed instant in UTC, TEST_NOW (exported by tests/support/screen.ts): work out expected dates, ages and durations from TEST_NOW, never from the real clock, and never hard-code a value that only holds on one day.
+- You may run "npx tsc --noEmit" to check the tests compile. When every test is written, run your own new test files once (npx vitest run <your files>) and read how each test fails: on an assertion or "not implemented", never on a crash in the set-up or while rendering. Fix a test that crashes, or that passes, before you return. Run nothing else, and at most twice: the factory runs and judges every test itself in its test lab.
 - Test each criterion at its level: ${screens ? `"unit" criteria` : `"unit" and "ui" criteria`} call the module directly; ${apiSide ? API_SIDE_TESTS : `"api" criteria call the route handler (for example GET or POST exported from app/api/.../route.ts, with a Request).`} Skip "manual" criteria: a person checks those.
 ${outsideSystemsTestRule(stack)}${screens ? `\n${SCREEN_TEST_RULES}` : ""}`;
   }
@@ -57,11 +58,13 @@ ${outsideSystemsTestRule(stack)}${screens ? `\n${SCREEN_TEST_RULES}` : ""}`;
 Rules:
 - Put tests in the existing test project that best fits (look for *Tests.csproj). Follow the style of existing tests there (xUnit, WebApplicationFactory if used).
 - Test through public surfaces only: HTTP endpoints, public service methods, database rows. Don't test private code.
+- Every test that starts the app or touches the database gets a database of its own: if the test project has AppFactory (App.Tests/AppFactory.cs), use it as the class fixture (IClassFixture<AppFactory>) and restart with factory.Restarted(). Never assume a table is empty unless your own class's database is the only one it could have been written to, and never depend on what another test left behind.
+- Don't compare against the current time exactly: assert on the values your test sent, or allow a margin.
 - Name each acceptance test method exactly AC_<req>_<n>_<Words> for acceptance criterion AC-<req>.<n>, e.g. AC_1_2_Returns404WhenOrderMissing. Name characterisation test methods CHAR_<Words>. The factory finds tests by these names.
 - New APIs exist as stubs that throw NotImplementedException; tests must compile against them and fail for now.
 - Also write characterisation tests for existing behaviour next to the change that must NOT change; those must pass today.
 - Don't change production code. Don't change test project files unless a package reference is missing and already restored.
-- You may run "dotnet build" to check the tests compile. There's no database in this container; don't try to make tests pass. Don't run "dotnet test": the factory runs the tests itself in its test lab.
+- You may run "dotnet build <the test project's .csproj>" to check the tests compile. Run it plainly: never with --no-restore (nothing is restored in this checkout yet, so that build fails on every file) and never with --no-build. The packages are already on this machine, so the restore needs no network. If the errors are in files outside the test project (a stub that does not compile), do not try to work around them: say so in "notes" and return. There's no database in this container; don't try to make tests pass. Don't run "dotnet test": the factory runs the tests itself in its test lab.
 - Test each criterion at its level: "unit" criteria call the class's public method directly (no web host, no database, no job run); "api" criteria call the endpoint. Skip "manual" criteria: a person checks those.
 ${outsideSystemsTestRule(stack)}`;
 }
@@ -94,3 +97,17 @@ ${outsideSystemsImplementRule(stack)}
     : `You may run "dotnet build" and unit tests that need no database. The factory runs the full checks after you finish.`}
 ${database ? `- PostgreSQL keeps a time to the microsecond, and DateTime.UtcNow is finer than that. Cut a time to the microsecond before you save it, so the value the API returns on create is the value it returns when the row is read again.\n` : ""}- This session has no memory beyond its context window, and everything a command prints or a file read returns stays in it. Print only what you need (pipe long output through tail or grep), read part of a large file instead of all of it, and change a file with Edit instead of writing it again.`;
 }
+
+/**
+ * What makes a locked test fail for a reason other than the code under test, said once for the test writer and the check that
+ * reads its tests. Runs ae5c and 768d each parked on one of these; any requirement can hit them.
+ */
+export const SELF_CONTAINED_RULES = `A TEST MUST PASS OR FAIL ON THE CODE ALONE, on every run and every machine:
+- Time: no value that depends on today's date or the current time (use the fixed test instant, or values the test itself set).
+- Stored data: no reliance on rows, files or state another test or an earlier run left behind; create what you assert on.
+- Order: assert an order only where the criterion names one; otherwise compare as sets.
+- Numbers: compare computed decimals (ratios, averages, money after division) with a tolerance or at the precision shown.
+- Randomness: no assertion on a generated id, code or random value; assert that it exists, or use the value the response returned.
+- Actions: after a click, save or delete, wait for its result (findBy, waitFor or the awaited response) before asserting on it.
+- Lookups: find a value inside its row, card or region, never page-wide when the same text can appear twice.
+- Data: when a criterion says each, all, every, a list or an order, give it at least three rows of your own that differ.`;

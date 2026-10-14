@@ -4,7 +4,8 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { basename, join, sep } from "node:path";
 import type { z } from "zod";
-import type { Design as DesignSchema } from "../contracts/artifacts.js";
+import type { ClientIntentBody, Design as DesignSchema } from "../contracts/artifacts.js";
+import type { Transcript } from "../contracts/index.js";
 import type { Breakdown, Estimate } from "../contracts/estimate.js";
 import { buildInventory, type DesignInventory } from "../design/inventory.js";
 import { depsOf, detectLayout } from "../design/layout.js";
@@ -85,7 +86,7 @@ export async function busyRun(project: string): Promise<{ runId: string } | unde
  * `cannotBuild`: for such an estimate, why a new product (web app + API) would not build all of it (it prices a phone app);
  * `cannotBuildWebOnly`: why a web app alone, on a backend the client provides, would not (it prices backend work too).
  */
-export interface ApprovedEstimateRow { runId: string; project: string; request: string; createdAt: string; deliveryModel: string; repo: boolean; cannotBuild?: string; cannotBuildWebOnly?: string }
+export interface ApprovedEstimateRow { runId: string; project: string; request: string; createdAt: string; deliveryModel: string; repo: boolean; /** made with the design left out: a build from it draws its own */ noDesign?: true; cannotBuild?: string; cannotBuildWebOnly?: string }
 
 /** Estimate runs that are approved and exported: the ones a build can start from (factory start --from-estimate). */
 export function approvedEstimatesView(): ApprovedEstimateRow[] {
@@ -104,7 +105,7 @@ export function approvedEstimatesView(): ApprovedEstimateRow[] {
         cannotBuild = newProductRefusal(id, scope, true);
         cannotBuildWebOnly = newProductRefusal(id, scope, false);
       }
-      rows.push({ runId: id, project: s.info.project, request: shortRequest(s.info.request), createdAt: s.info.createdAt, deliveryModel: s.info.estimate?.deliveryModel ?? "hitl", repo, ...(cannotBuild ? { cannotBuild } : {}), ...(cannotBuildWebOnly ? { cannotBuildWebOnly } : {}) });
+      rows.push({ runId: id, project: s.info.project, request: shortRequest(s.info.request), createdAt: s.info.createdAt, deliveryModel: s.info.estimate?.deliveryModel ?? "hitl", repo, ...(s.info.estimate?.drawDesign === false ? { noDesign: true as const } : {}), ...(cannotBuild ? { cannotBuild } : {}), ...(cannotBuildWebOnly ? { cannotBuildWebOnly } : {}) });
     } catch { /* a broken ledger doesn't hide the others */ }
   }
   return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 50);
@@ -243,7 +244,7 @@ export function gateChips(s: RunState): GateChip[] {
 export function cardCommands(markdown: string, runId: string, hash8: string): string[] {
   const out = [`factory show-card ${runId}`];
   for (const line of markdown.split("\n")) {
-    const m = /(?:^|\s|`)(factory (?:approve|reject|answer|sign-off|waive-cap|waive-budget|stop)\s[^`]*?)`?\s*$/.exec(line);
+    const m = /(?:^|\s|`)(factory (?:approve|reject|answer|edit-intent|sign-off|waive-cap|waive-budget|stop)\s[^`]*?)`?\s*$/.exec(line);
     if (m) out.push(m[1]!.replace(/\s+/g, " ").replace("<hash>", hash8).trim());
   }
   return [...new Set(out)];
@@ -261,6 +262,34 @@ function evidence(ledger: Ledger, seq: number) {
 }
 
 /** The questions on a run's question card, so the run page can ask them. */
+/** An open client-intent card as data for the run page's editor (spec 2026-10-14 transcript-intent §5c); undefined when its data is missing. */
+export interface IntentView {
+  project: { name?: string; goal: string };
+  requirements: { id: string; text: string; status: string; quote?: string; turn?: string; speaker?: string; role?: string; added?: string; /** the whole turn the quote is from, to read it in context */ said?: string }[];
+  speakers: { name: string; role: string; source: string }[];
+  constraints: string[]; openQuestions: string[]; warnings: string[]; dropped: string[];
+}
+export function intentOf(ledger: Pick<Ledger, "getJson">, sha: string, transcriptSha?: string): IntentView | undefined {
+  let body: { intent?: ClientIntentBody } | undefined;
+  try { body = ledger.getJson<{ intent?: ClientIntentBody }>(sha); } catch { return undefined; }
+  const i = body?.intent;
+  if (!i) return undefined;
+  let turns: Transcript["turns"] = [];
+  try { turns = (transcriptSha ? ledger.getJson<Transcript>(transcriptSha)?.turns : undefined) ?? []; } catch { /* the quotes still show */ }
+  const said = new Map(turns.map((t) => [t.id, t.text]));
+  return {
+    project: i.project,
+    requirements: i.requirements.map((r) => ({
+      id: r.id, text: r.text, status: r.status, ...(r.quote ? { quote: r.quote } : {}), ...(r.turn ? { turn: r.turn } : {}),
+      ...(r.speaker ? { speaker: r.speaker } : {}), ...(r.role ? { role: r.role } : {}), ...(r.addedBy ? { added: `${r.addedBy.by}: ${r.addedBy.note}` } : {}),
+      ...(r.turn && said.has(r.turn) ? { said: said.get(r.turn)! } : {}),
+    })),
+    speakers: i.speakers,
+    constraints: i.constraints.map((c) => `${c.id}: ${c.text}`), openQuestions: i.openQuestions.map((q) => `${q.id}: ${q.text}`),
+    warnings: i.warnings, dropped: i.dropped.map((d) => `${d.id}: ${d.text} (${d.why})`),
+  };
+}
+
 function questionsOf(ledger: Ledger, sha: string) {
   const body = ledger.getJson<{ asked?: { id: string; text: string; options: string[]; recommended: string; reason: string; impactReason: string }[]; assumptions?: { id: string; text: string }[] }>(sha);
   if (!body?.asked?.length) return {};
@@ -316,7 +345,7 @@ export function runView(ledger: Ledger) {
     gates: gateChips(s),
     // the model each step was given when the run was created, and what was called on each
     models: runModels(events),
-    card: s.openCard ? { kind: s.openCard.kind, hash: hash8, markdown: card ?? "(the card file is missing)", commands: cardCommands(card ?? "", ledger.runId, hash8), ...(s.openCard.kind === "question" ? questionsOf(ledger, s.openCard.artifactSha) : {}), ...limitOf(s) } : undefined,
+    card: s.openCard ? { kind: s.openCard.kind, hash: hash8, markdown: card ?? "(the card file is missing)", commands: cardCommands(card ?? "", ledger.runId, hash8), ...(s.openCard.kind === "question" ? questionsOf(ledger, s.openCard.artifactSha) : {}), ...(s.openCard.kind === "intent" ? { intent: intentOf(ledger, s.openCard.artifactSha, s.info.transcriptSha) } : {}), ...limitOf(s) } : undefined,
     trace,
     // what the factory asked each model and what came back (src/ui/talk.ts)
     talk: talkView(lines),
@@ -539,11 +568,12 @@ export function estimateView(ledger: Ledger) {
       return { by: String(a.by ?? ""), hash: String(a.hash ?? ""), ...(a.auto ? { auto: true } : {}) };
     })() : undefined,
     // a hands-off run: nobody was asked, so what clarify found unclear is listed as the factory's assumptions
-    ...(!humanReview(s.info) ? { handsOff: true, factoryAssumptions: ["clarify", "clarify-2"].flatMap((k) => {
+    // (a transcript run's meeting first: what distill approved without a person, src/stages/distill.ts assumedOf)
+    ...(!humanReview(s.info) ? { handsOff: true, factoryAssumptions: ((s.steps.get("distill")?.data?.assumed ?? []) as { id: string; text: string; risk: string }[]).concat(["clarify", "clarify-2"].flatMap((k) => {
       const sha = done(k);
       const r = sha ? ledger.getJson<{ assumedBy?: string; assumptions?: { id: string; text: string; risk: string; fromDefault?: string }[] }>(sha) : undefined;
       return r?.assumedBy ? (r.assumptions ?? []).map((a) => ({ id: a.id, text: a.text, risk: a.risk, ...(a.fromDefault ? { fromDefault: a.fromDefault } : {}) })) : [];
-    }).concat(factoryAssumed(ledger)) } : {}),
+    })).concat(factoryAssumed(ledger)) } : {}),
     files,
   };
 }

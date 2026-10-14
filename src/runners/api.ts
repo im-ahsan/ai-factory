@@ -38,9 +38,11 @@ export interface Conversation {
   /** Plain user nudge (when the model answered without calling a tool). */
   say(text: string): void;
 }
+/** `cacheUserPrefix`: characters at the start of the user message to mark for prompt caching (a step that re-sends the same head). */
+export interface StartOptions { cacheUserPrefix?: number }
 export interface Provider {
-  /** `images` go with the first user message, each labelled "Image n" to match the briefing's markers. */
-  start(model: string, effort: Effort | undefined, system: string, user: string, tools: ToolSpec[], images?: ModelImage[]): Conversation;
+  /** `images` go with the first user message, each labelled "Image n" to match the briefing's markers. OpenAI ignores `opts` (it caches long prefixes itself). */
+  start(model: string, effort: Effort | undefined, system: string, user: string, tools: ToolSpec[], images?: ModelImage[], opts?: StartOptions): Conversation;
 }
 
 const imageLabel = (i: number) => `Image ${i + 1}:`;
@@ -54,15 +56,21 @@ export function cachesConversation(tools: ToolSpec[], messages: number): boolean
   return messages > 1 || tools.some((t) => t.name !== SUBMIT);
 }
 
-/** Anthropic: each image after its label, then the briefing (images before the text that refers to them). */
-export function anthropicUserContent(user: string, images: ModelImage[] = []): string | Anthropic.ContentBlockParam[] {
-  if (!images.length) return user;
+/**
+ * Anthropic: each image after its label, then the briefing (images before the text that refers to them). `cachePrefix`: the
+ * briefing's first characters that a step re-sends unchanged (a repair after a first answer), marked for prompt caching.
+ */
+export function anthropicUserContent(user: string, images: ModelImage[] = [], cachePrefix = 0): string | Anthropic.ContentBlockParam[] {
+  const text: Anthropic.ContentBlockParam[] = cachePrefix > 0 && cachePrefix < user.length
+    ? [{ type: "text", text: user.slice(0, cachePrefix), cache_control: { type: "ephemeral" } }, { type: "text", text: user.slice(cachePrefix) }]
+    : [{ type: "text", text: user }];
+  if (!images.length) return text.length === 1 ? user : text;
   return [
     ...images.flatMap((m, i): Anthropic.ContentBlockParam[] => [
       { type: "text", text: imageLabel(i) },
       { type: "image", source: { type: "base64", media_type: m.mediaType, data: m.base64 } },
     ]),
-    { type: "text", text: user },
+    ...text,
   ];
 }
 
@@ -146,9 +154,9 @@ export class AnthropicProvider implements Provider {
     this.client = new Anthropic({ apiKey, maxRetries: 2 });
   }
 
-  start(model: string, effort: Effort | undefined, system: string, user: string, tools: ToolSpec[], images: ModelImage[] = []): Conversation {
+  start(model: string, effort: Effort | undefined, system: string, user: string, tools: ToolSpec[], images: ModelImage[] = [], opts?: StartOptions): Conversation {
     const client = this.client;
-    const messages: Anthropic.MessageParam[] = [{ role: "user", content: anthropicUserContent(user, images) }];
+    const messages: Anthropic.MessageParam[] = [{ role: "user", content: anthropicUserContent(user, images, opts?.cacheUserPrefix) }];
     // Stable prefix first: tools → system; cache it (context-builder §2.3).
     const toolParams: Anthropic.Tool[] = tools.map((t) => ({
       name: t.name, description: t.description, input_schema: t.schema as Anthropic.Tool.InputSchema,
@@ -373,7 +381,7 @@ export interface TurnTrace {
   mended?: string[];
 }
 
-function zodIssues(err: z.ZodError): string {
+export function zodIssues(err: z.ZodError): string {
   return err.issues.slice(0, 10).map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ");
 }
 
@@ -459,8 +467,10 @@ export class ApiRunner implements Runner {
       // a broken or oversized image is the factory's mistake, not the model's: stop before paying for a call
       return { status: "config-error", error: (e as Error).message, usage: { ...usage, wallMs: Date.now() - started } };
     }
-    const convo = this.deps.provider(job.model).start(job.model, job.effort, system, job.pack.user, tools, images);
+    const convo = this.deps.provider(job.model).start(job.model, job.effort, system, job.pack.user, tools, images, job.cacheBriefing ? { cacheUserPrefix: job.pack.userStable } : undefined);
     let reasks = 0;
+    const maxReasks = job.limits.reasks ?? MAX_REASKS;
+    let rejected: Result<T>["rejected"];
 
     const done = (status: Result<T>["status"], extra: Partial<Result<T>> = {}): Result<T> =>
       ({ status, usage: { ...usage, wallMs: Date.now() - started }, ...extra });
@@ -525,6 +535,7 @@ export class ApiRunner implements Runner {
           } else if (!parsed.success) {
             reasks++;
             schemaError = zodIssues(parsed.error);
+            rejected = { input: c.input, issues: schemaError };
             results.push({ id: c.id, content: `The result doesn't match the schema: ${schemaError}. Fix it and call ${SUBMIT} again.`, isError: true });
           } else {
             results.push({ id: c.id, content: "Already accepted." });
@@ -545,7 +556,7 @@ export class ApiRunner implements Runner {
       if (over) return done("over-budget");
       // a submit cut off mid-way fails the schema; asking again only buys the same cut-off answer
       if (t.stop === "max_tokens") return done("bad-output", { error: CUT_OFF });
-      if (reasks > MAX_REASKS) return done("bad-output", { error: "Output failed the schema after 2 re-asks" });
+      if (reasks > maxReasks) return done("bad-output", { error: maxReasks ? `Output failed the schema after ${maxReasks} re-asks` : `Output failed the schema: ${rejected?.issues ?? "no answer"}`, ...(rejected ? { rejected } : {}) });
       // one turn left: say so, so the model answers with what it has instead of running out mid-search
       if (turn === job.limits.maxTurns - 2 && results.length) {
         const last = results[results.length - 1]!;

@@ -13,8 +13,21 @@ const JSON_TYPE = "application/json";
 export function readContract(text: string): Obj | undefined {
   try {
     const d = parse(text) as Obj;
-    return d && typeof d === "object" && typeof d.openapi === "string" && d.paths && typeof d.paths === "object" ? d : undefined;
+    if (!(d && typeof d === "object" && typeof d.openapi === "string" && d.paths && typeof d.paths === "object")) return undefined;
+    for (const [name, s] of Object.entries((d.components?.schemas ?? {}) as Obj)) selfRefs(s, `#/components/schemas/${name}/`);
+    return d;
   } catch { return undefined; }
+}
+
+/**
+ * .NET's generator writes a second use of one type inside a schema as "#/components/schemas/#/properties/a/items", meaning
+ * "#/properties/a/items" of that schema (run 768d: list fields read as missing on 4 attempts). Written out in full, it resolves.
+ */
+function selfRefs(o: unknown, at: string): void {
+  if (!o || typeof o !== "object") return;
+  const x = o as Obj;
+  if (typeof x.$ref === "string" && x.$ref.startsWith("#/components/schemas/#/")) x.$ref = at + x.$ref.slice("#/components/schemas/#/".length);
+  for (const v of Object.values(x)) selfRefs(v, at);
 }
 
 /**
@@ -68,18 +81,54 @@ export function contractProblems(doc: Obj): string[] {
     const rs = Object.entries((def.responses ?? {}) as Obj);
     if (!rs.length) bad.push(`${op} has no response.`);
     for (const [code, r] of rs) {
-      const c = (r as Obj)?.content?.[JSON_TYPE] as Obj | undefined;
+      const c = deref(doc, r as Obj)?.content?.[JSON_TYPE] as Obj | undefined;
       if (c && c.example === undefined && !c.examples) bad.push(`${op} ${code} has no example (the frontend's tests run against it).`);
     }
   }
   return bad;
 }
 
+/** What a "$ref" points at, followed to its end: a schema, or a whole answer, request body or parameter kept under components. */
+function deref(doc: Obj, o: Obj | undefined): Obj | undefined {
+  for (let i = 0; o && typeof o.$ref === "string" && i < 12; i++) o = o.$ref.split("/").slice(1).reduce((x: Obj | undefined, k: string) => x?.[k], doc);
+  return o;
+}
+
+/**
+ * A schema with its wrappers taken off, so both ways of writing one thing read the same: "allOf" around a pointer (how a
+ * contract adds a description to a shared type) is that type, several "allOf" parts are one object, and "oneOf"/"anyOf" with
+ * one real member (the other says only "or null") is that member.
+ */
+function whole(doc: Obj, schema: Obj | undefined, depth = 0): Obj | undefined {
+  const s = deref(doc, schema);
+  if (!s || depth > 12) return s;
+  if (Array.isArray(s.allOf) && s.allOf.length) {
+    const parts = s.allOf.map((p: Obj) => whole(doc, p, depth + 1) ?? {});
+    const { allOf: _, ...own } = s;
+    return { ...Object.assign({}, ...parts), ...own, properties: Object.assign({}, ...parts.map((p: Obj) => p.properties), own.properties), required: [...parts.flatMap((p: Obj) => p.required ?? []), ...(own.required ?? [])] };
+  }
+  const real = (s.oneOf ?? s.anyOf)?.filter((m: Obj) => m?.type !== "null" && !(m && Object.keys(m).every((k) => k === "nullable")));
+  if (s.type === undefined && !s.properties && real?.length === 1) return whole(doc, real[0], depth + 1);
+  return s;
+}
+
+/** The one type every value of an enum has, when it has one: "string", "integer", "number" or "boolean". */
+function enumType(values: unknown): string | undefined {
+  if (!Array.isArray(values)) return undefined;
+  const real = values.filter((v) => v !== null);
+  const kinds = new Set(real.map((v) => (typeof v === "number" ? (Number.isInteger(v) ? "integer" : "number") : typeof v)));
+  if (kinds.size === 2 && kinds.has("integer") && kinds.has("number")) return "number";
+  const [only] = kinds;
+  return real.length && kinds.size === 1 && (only === "string" || only === "integer" || only === "number" || only === "boolean") ? only : undefined;
+}
+
 /** A schema as flat facts ("body.items[].id" -> "integer"), following $ref; what a generator adds (format, description) is left out. */
 function facts(doc: Obj, schema: Obj | undefined, at: string, out: Map<string, string>, depth = 0, detail = false): void {
+  schema = whole(doc, schema);
   if (!schema || depth > 12) return;
-  if (typeof schema.$ref === "string") return facts(doc, schema.$ref.split("/").slice(1).reduce((o: Obj | undefined, k: string) => o?.[k], doc), at, out, depth + 1, detail);
-  const type = Array.isArray(schema.type) ? [...schema.type].sort().join("|") : schema.type ?? (schema.properties ? "object" : "any");
+  // a list of allowed values with no type (how .NET writes an enum sent as text) has the type its values have (run e8ef:
+  // `role` was { enum: ["employee", "administrator"] } and was read as "any" against the contract's "string")
+  const type = Array.isArray(schema.type) ? [...schema.type].sort().join("|") : schema.type ?? (schema.properties ? "object" : enumType(schema.enum) ?? "any");
   if (type === "array") return facts(doc, schema.items, `${at}[]`, out, depth + 1, detail);
   if (detail && Array.isArray(schema.enum)) out.set(`${at} values`, schema.enum.map(String).sort().join(", "));
   if (detail && at.includes(".")) out.set(`${at} nullable`, schema.nullable === true ? "yes" : "no");
@@ -97,12 +146,13 @@ function contractFacts(doc: Obj, detail = false): Map<string, string> {
     out.set(op, "exists");
     if (detail) {
       out.set(`${op} operationId`, String(def.operationId ?? "none"));
-      for (const p of (def.parameters ?? []) as Obj[]) out.set(`${op} parameter ${p.name} (${p.in})`, `${p.schema?.type ?? "any"}, ${p.required ? "required" : "optional"}`);
+      for (const p of ((def.parameters ?? []) as Obj[]).map((x) => deref(doc, x) ?? {})) out.set(`${op} parameter ${p.name} (${p.in})`, `${whole(doc, p.schema)?.type ?? "any"}, ${p.required ? "required" : "optional"}`);
     }
-    facts(doc, def.requestBody?.content?.[JSON_TYPE]?.schema, `${op} request`, out, 0, detail);
+    // an answer or a request body may be a pointer to a shared one under components (run e8ef: 53 shared error answers were read as having no body)
+    facts(doc, deref(doc, def.requestBody)?.content?.[JSON_TYPE]?.schema, `${op} request`, out, 0, detail);
     for (const [code, r] of Object.entries((def.responses ?? {}) as Obj)) {
       out.set(`${op} ${code}`, "exists");
-      facts(doc, (r as Obj)?.content?.[JSON_TYPE]?.schema, `${op} ${code} body`, out, 0, detail);
+      facts(doc, deref(doc, r as Obj)?.content?.[JSON_TYPE]?.schema, `${op} ${code} body`, out, 0, detail);
     }
   }
   return out;
@@ -136,8 +186,14 @@ export const contractMatches = defineGate<{ contract: { text: string }; built: {
     const have = built.text === undefined ? undefined : readContract(built.text);
     if (!have) return verdict([failure("contract", `The build did not write the API's OpenAPI document at ${built.path}. Keep the project's build-time OpenAPI settings and the AddOpenApi() call.`)], "");
     // one task of several: an operation no task has built yet is not a mismatch; what is built must match, and nothing extra
-    const diff = contractDiff(want, have).filter((d) => !built.partial || !/^missing in the API: [A-Z]+ \S+$/.test(d));
-    return verdict(diff.slice(0, 20).map((d) => failure("contract", `The API does not match the locked contract: ${d}`)), "The API matches the locked contract");
+    const all = contractDiff(want, have);
+    const diff = all.filter((d) => !built.partial || !/^missing in the API: [A-Z]+ \S+$/.test(d));
+    const inContract = operations(want).length, inApi = operations(have).length;
+    return {
+      ...verdict(diff.slice(0, 20).map((d) => failure("contract", `The API does not match the locked contract: ${d}`)), "The API matches the locked contract"),
+      // what was compared, so a pass can be told from a check that had little to look at
+      facts: { operationsInContract: inContract, operationsInApi: inApi, notBuiltYetLeftOut: all.length - diff.length, differences: diff.length, differencesShown: Math.min(diff.length, 20), partial: !!built.partial },
+    };
   },
 });
 

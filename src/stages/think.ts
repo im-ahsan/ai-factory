@@ -8,7 +8,7 @@ import { Redactor } from "../context/secrets.js";
 import { estimateTokens } from "../context/tokens.js";
 import type { RepoTools } from "../context/tools.js";
 import { ApiRunner, defaultProvider, type Provider } from "../runners/api.js";
-import type { StepContext, StepOutcome } from "./framework.js";
+import { failureLines, type StepContext, type StepOutcome } from "./framework.js";
 import { answersText } from "./gate-questions.js";
 import { argsSummary, type Trace } from "../util/trace.js";
 import { cacheDisabled, cacheForget, cacheGet, cacheKey, cachePut } from "../estimate/cache.js";
@@ -48,17 +48,26 @@ export interface ThinkSpec<T> {
   hardTimeout?: boolean;
   /** Use this effort instead of the route's (e.g. a lighter critic on the light lane). */
   effort?: Effort;
+  /** How often an answer that fails the schema is asked for again in the same conversation (default 2). 0: the refused answer comes back as `draft`, for a caller that fixes it more cheaply than a second whole answer. */
+  reasks?: number;
+  /**
+   * Mark the briefing's stable head (everything before feedback, task and recap) for prompt caching: for a step that may call
+   * the model twice in a row over the same large input (distill's repair). Anthropic only; OpenAI caches long prefixes itself.
+   */
+  cacheBriefing?: boolean;
 }
 
 export type ThinkResult<T> =
   /** `forget` drops the stored answer when the step's own checks reject it */
   | { ok: true; output: T; model: string; packSha: string; note?: string; forget?: () => void }
-  | { ok: false; outcome: StepOutcome };
+  /** `draft`: the answer that failed the schema, as the model gave it, and what was wrong with it */
+  | { ok: false; outcome: StepOutcome; draft?: { input: unknown; issues: string } };
 
 /**
- * A step's budget is sized for a change request. Two inputs are what they are and must be read whole, so the budget grows by
+ * A step's budget is sized for a change request. Three inputs are what they are and must be read whole, so the budget grows by
  * their size (capped) and the usual room stays:
  * - the factory's own earlier outputs (sketches, drafts, a spec), which grow with the request, in every mode;
+ * - a repo document the step is held to (a product's locked API contract), which grows with the product, in every mode;
  * - the untrusted requirements document, in an estimate or a design-only run, where it is far longer than a change request.
  */
 export function budgetFor(ctx: Pick<StepContext, "state">, base: number | undefined, sections: ResolvedSection[], model: string): number | undefined {
@@ -66,7 +75,8 @@ export function budgetFor(ctx: Pick<StepContext, "state">, base: number | undefi
   const size = (pick: (x: ResolvedSection) => boolean) => sections.filter(pick).reduce((n, x) => n + estimateTokens(x.content, model), 0);
   const own = size((x) => x.spec.source === "artifact");
   const doc = readsRequirements(ctx.state.info.mode) ? size((x) => x.spec.trust === "untrusted") : 0;
-  return Math.min(Math.max(base, 180_000), base + (own > base / 2 ? own : 0) + (doc > base / 2 ? doc : 0));
+  const held = size((x) => !!x.whole);
+  return Math.min(Math.max(base, 180_000), base + (own > base / 2 ? own : 0) + (doc > base / 2 ? doc : 0) + (held > base / 2 ? held : 0));
 }
 
 /** how often a streaming answer's progress is logged (under the trace's one-minute heartbeat) */
@@ -88,7 +98,7 @@ export async function think<T>(ctx: StepContext, spec: ThinkSpec<T>): Promise<Th
   if (ctx.priorFailures.length) {
     sections.push({
       spec: { id: "failures", source: "feedback", trust: "derived", placement: "user" },
-      content: "Your previous attempt was rejected for these reasons. Fix them:\n" + ctx.priorFailures.map((f) => `- [${f.check}] ${f.message}`).join("\n"),
+      content: "Your previous attempt was rejected for these reasons. Fix them:\n" + failureLines(ctx.priorFailures, 12_000),
     });
   }
   // the answers to questions this step's failing checks raised (src/stages/gate-questions.ts)
@@ -155,9 +165,9 @@ export async function think<T>(ctx: StepContext, spec: ThinkSpec<T>): Promise<Th
   });
   ctx.log(`${spec.label ?? spec.stage}: ${model} (effort ${effort}), pack ${pack.manifest.packTokens} tokens`);
   const r = await runner.run({
-    step: spec.stage, model, effort, pack, schema: spec.schema,
+    step: spec.stage, model, effort, pack, schema: spec.schema, ...(spec.cacheBriefing ? { cacheBriefing: true } : {}),
     // never more than what's left of the run's cost limit
-    limits: { maxTurns: spec.maxTurns ?? 8, maxUsd: stepBudgetUsd(replay(ctx.ledger.events()), spec.maxUsd ?? 2, ctx.share), timeoutSec: spec.timeoutSec ?? 900, ...(spec.hardTimeout ? { hardTimeout: true } : {}) },
+    limits: { maxTurns: spec.maxTurns ?? 8, maxUsd: stepBudgetUsd(replay(ctx.ledger.events()), spec.maxUsd ?? 2, ctx.share), timeoutSec: spec.timeoutSec ?? 900, ...(spec.hardTimeout ? { hardTimeout: true } : {}), ...(spec.reasks !== undefined ? { reasks: spec.reasks } : {}) },
   });
   if (r.status === "ok") {
     if (key) cachePut({ key, step: spec.stage, route: spec.route, model, runId: ctx.runId, createdAt: new Date().toISOString(), output: r.output });
@@ -169,6 +179,7 @@ export async function think<T>(ctx: StepContext, spec: ThinkSpec<T>): Promise<Th
   return {
     ok: false,
     outcome: { kind: "fail", category, failures: [{ check: `runner-${r.status}`, message: r.error ?? r.status, frames: [] }], signature: `${spec.stage}:${r.status}` },
+    ...(r.status === "bad-output" && r.rejected ? { draft: r.rejected } : {}),
   };
 }
 
