@@ -93,6 +93,50 @@ describe("the locked API contract", () => {
     expect(contractDiff(contract, more)).toEqual(["not in the contract: GET /api/extra"]);
   });
 
+  it("reads a shared answer, a shared request body and allOf around a pointer as what they point at (runs e8ef, e1b5)", () => {
+    // the same contract as CONTRACT, written the way planners write it: the 400 answer and the request body kept once under
+    // components, and a field's type given as allOf around a pointer so it can carry a description
+    const shared = readContract(CONTRACT)!;
+    const post = shared.paths["/api/sign-in"].post;
+    shared.components.responses = { BadEmail: post.responses["400"] };
+    post.responses["400"] = { $ref: "#/components/responses/BadEmail" };
+    shared.components.requestBodies = { SignIn: post.requestBody };
+    post.requestBody = { $ref: "#/components/requestBodies/SignIn" };
+    shared.components.schemas.Status = { type: "string" };
+    shared.components.schemas.Appointment.properties.status = { allOf: [{ $ref: "#/components/schemas/Status" }], description: "Confirmed or not" };
+    // an API that says what the contract says matches, either way round
+    expect(contractDiff(shared, built())).toEqual([]);
+    expect(contractDiff(contract, shared)).toEqual([]);
+    expect(contractProblems(shared)).toEqual([]);
+    // and the shared answer's body is held: an API that declares the status with no body does not match
+    const noBody = built();
+    delete noBody.paths["/api/sign-in"].post.responses["400"].content;
+    expect(contractDiff(shared, noBody)).toEqual(["missing in the API: POST /api/sign-in 400 body"]);
+    // a nullable pointer written as oneOf with "or null" is the type it points at
+    const nullable = built();
+    nullable.components.schemas.Appointment.properties.status = { oneOf: [{ nullable: true }, { $ref: "#/components/schemas/Status" }] };
+    nullable.components.schemas.Status = { type: "string" };
+    expect(contractDiff(shared, nullable)).toEqual([]);
+  });
+
+  it("reads a field given only as a list of allowed values as the type of those values (run e8ef, TASK-1 attempt 4)", () => {
+    // a .NET enum field comes out of the build as { enum: [...] } with no type; the contract says string
+    const listed = built();
+    listed.components.schemas.Appointment.properties.status = { enum: ["Confirmed", "Cancelled"] };
+    expect(contractDiff(contract, listed)).toEqual([]);
+    // values of another type are still a difference, and a list of mixed types is no type at all
+    const numbers = built();
+    numbers.components.schemas.Appointment.properties.status = { enum: [0, 1] };
+    expect(contractDiff(contract, numbers)).toEqual(["GET /api/appointments/today 200 body[].status: the contract says string, the API has integer"]);
+    const mixed = built();
+    mixed.components.schemas.Appointment.properties.status = { enum: ["Confirmed", 1] };
+    expect(contractDiff(contract, mixed)).toEqual(["GET /api/appointments/today 200 body[].status: the contract says string, the API has any"]);
+  });
+
+  it("says how much it compared, so a pass can be told from a pass on nothing", () => {
+    expect(gate(builtText)).toMatchObject({ passed: true, facts: { operationsInContract: 2, operationsInApi: 2, differences: 0, partial: false } });
+  });
+
   it("fails plainly when the build wrote no document", () => {
     expect(gate(undefined)).toMatchObject({ passed: false, details: expect.stringMatching(/did not write the API's OpenAPI document at Api\/openapi\/built\.json/) });
   });

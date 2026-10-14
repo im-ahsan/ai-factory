@@ -59,7 +59,7 @@ export function agentDatabase(project: Pick<ProjectConfig, "stack" | "database">
 }
 
 /** `result`: what a tool call returned, in characters. `compact`: the session's context was summarised (`pre` = tokens before). */
-export interface AgentProgress { ts: number; kind: "start" | "tool" | "result" | "compact" | "turn" | "end"; tool?: string; target?: string; id?: string; in?: number; out?: number; cacheRead?: number; cacheWrite?: number; text?: string; status?: string; turns?: number; costUsd?: number; model?: string; chars?: number; pre?: number; trigger?: string }
+export interface AgentProgress { ts: number; kind: "start" | "tool" | "result" | "compact" | "turn" | "end" | /** the whole session, read from transcript.jsonl when it ends (`text`) */ "transcript"; tool?: string; target?: string; id?: string; in?: number; out?: number; cacheRead?: number; cacheWrite?: number; text?: string; status?: string; turns?: number; costUsd?: number; model?: string; chars?: number; pre?: number; trigger?: string }
 
 /**
  * Spend from the per-turn lines when the agent left no SDK total (timeout, crash): tokens summed,
@@ -228,7 +228,8 @@ export class ClaudeAgentRunner implements Runner {
       { src: outDir, dst: "/job/out" },
     ];
     // no git metadata in container A
-    if (existsSync(join(job.workdir, ".git"))) {
+    const gitHidden = existsSync(join(job.workdir, ".git"));
+    if (gitHidden) {
       mounts.push(lstatSync(join(job.workdir, ".git")).isDirectory()
         ? { src: emptyDir, dst: "/work/.git", ro: true }
         : { src: emptyFile, dst: "/work/.git", ro: true });
@@ -265,6 +266,9 @@ export class ClaudeAgentRunner implements Runner {
         image: AGENT_IMAGE, role: "agent", labels: { run: x.runId, key: x.key }, network: dbId ? `container:${dbId}` : AGENT_NET,
         user: `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`, workdir: "/work", mounts,
         env: {
+          // the .NET SDK's Source Link reads the hidden .git and fails every `dotnet build` before the compiler runs: run c944's
+          // test writers never saw a C# error, so the lab found them (two retries). MSBuild reads this property from the env.
+          ...(gitHidden ? { EnableSourceControlManagerQueries: "false" } : {}),
           ...x.agentEnv,
           ...dbEnv,
           ...this.modelEnv(token),
@@ -289,6 +293,11 @@ export class ClaudeAgentRunner implements Runner {
       }
       await this.rt.stop(id, 5); // kills leftover processes before the core commits
       await settle(progressFile);
+      // the session in full (every command as given, what came back, what the agent said), before the job folder goes
+      const transcriptFile = join(outDir, "transcript.jsonl");
+      if (x.onProgress && existsSync(transcriptFile)) {
+        try { x.onProgress({ ts: Date.now(), kind: "transcript", text: readFileSync(transcriptFile, "utf8") }); } catch { /* the trace never breaks a run */ }
+      }
       const resultPath = join(outDir, "result.json");
       // no SDK total (timeout, crash): count the spend from the per-turn lines before the folder goes
       const fromProgress = (): Usage => ({ ...usageFromProgress(progressFile, job.model), wallMs: Date.now() - started });

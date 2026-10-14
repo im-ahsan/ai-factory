@@ -58,6 +58,10 @@ function makeRepo(): string {
 const U = { inputTokens: 2000, outputTokens: 300, cacheRead: 0, cacheWrite: 0 };
 /** Three tasks, one criterion each: Greeter says Hello, Farewell says Bye, Third says Three. */
 let multi = false;
+/** multi: how many times the planner sends a plan that does not match its schema */
+let planBadShape = 0;
+/** multi: the plan's tasks do not build on each other (no task waits for another's files) */
+let unchained = false;
 /** how many times the multi-task planner leaves REQ-3 out of its plan */
 let planMisses = 0;
 /** what the scripted reviewer reports (non-blocking) */
@@ -88,10 +92,12 @@ function multiAnswer(system: string): unknown {
   }
   if (system.includes("plan the implementation")) {
     const one = answerFor(system, false) as { tasks: { reqs: string[]; fileScope: string[] }[] };
-    const t = (n: number) => ({ id: `TASK-${n}`, title: `Part ${n}`, reqs: [`REQ-${n}`], fileScope: [MULTI_FILES[n - 1]!], exemplars: [], conventions: [], dependsOn: n > 1 ? [`TASK-${n - 1}`] : [], plannedLoc: 3, approach: "small edit" });
+    const t = (n: number) => ({ id: `TASK-${n}`, title: `Part ${n}`, reqs: [`REQ-${n}`], fileScope: [MULTI_FILES[n - 1]!], exemplars: [], conventions: [], dependsOn: n > 1 && !unchained ? [`TASK-${n - 1}`] : [], plannedLoc: 3, approach: "small edit" });
     // a plan that failed its checks is asked for as a patch: only the missing task comes back
     if (system.includes("THE PLAN IS FIXED, NOT REWRITTEN")) return { tasks: [t(3)] };
     if (planMisses-- > 0) return { ...one, tasks: [t(1), t(2)] };
+    // a plan in the wrong shape: the third task's size is a word
+    if (planBadShape-- > 0) return { ...one, tasks: [t(1), t(2), { ...t(3), plannedLoc: "three lines" }] };
     return { ...one, tasks: [t(1), t(2), t(3)] };
   }
   return undefined;
@@ -105,8 +111,13 @@ let reviewCalls = 0;
 let proofVerdict: "proves-it" | "weak" | "no-test" | undefined;
 let proofCalls = 0;
 /** what the scripted test-or-code check says about every locked test it is asked about, and how often it was asked */
-let judgeVerdict: "code" | "test" | "unclear" = "code";
+let judgeVerdict: "code" | "test" | "scope" | "unclear" = "code";
 let judgeCalls = 0;
+/** "scope": the files the scripted check says the test needs */
+let judgeFiles: string[] = [];
+/** what the scripted check of a rewritten test says, and how often it was asked */
+let rewriteVerdict: "keeps" | "loosened" = "keeps";
+let rewriteChecks = 0;
 /** the spec also carries a criterion only a person can check */
 let manualCriterion = false;
 /** A scripted review must now account for every acceptance criterion, as a real one must. */
@@ -141,14 +152,18 @@ function answerFor(system: string, allowMulti = true, user = ""): unknown {
   if (system.includes("plan the implementation")) return {
     tasks: [{ id: "TASK-1", title: "Say Hello", reqs: ["REQ-1"], fileScope: ["src/Api/Greeter.cs"], exemplars: [], conventions: [], dependsOn: [], plannedLoc: 3, approach: "change the literal" }],
     options: [{ id: "O-1", summary: "change the literal", simplest: true, tradeoffs: "none" }, { id: "O-2", summary: "make it configurable", simplest: false, tradeoffs: "more code" }],
-    chosen: "O-1", adr: "Change the literal; configuration isn't asked for.", protectedPathsDeclared: [], newDependencies: [], stubs: [],
+    chosen: "O-1", adr: "Change the literal; configuration isn't asked for.", protectedPathsDeclared: [], newDependencies: [], stubs: planStubs.length > 1 ? planStubs.shift()! : planStubs[0] ?? [],
     // a backend that must give its data model (a new product's API) gets one
     ...(!planGivesNoModel && (system.includes("DATA MODEL. Give") || system.includes("The database as it is now")) ? { dataModel: { tables: [{ name: "Greetings", purpose: "the greeting text", columns: [{ name: "Id", type: "int", required: true, pk: true }, { name: "Text", type: "string", required: true }] }] } } : {}),
   };
   if (system.includes("review a finished change")) return scriptedReview(user, reviewFindings);
   if (system.includes("A locked acceptance test failed on two attempts")) {
     judgeCalls += 1;
-    return { verdicts: [...new Set([...user.matchAll(/"testId":\s*"([^"]+)"/g)].map((m) => m[1]!))].map((testId) => ({ testId, verdict: judgeVerdict, why: "scripted verdict" })) };
+    return { verdicts: [...new Set([...user.matchAll(/"testId":\s*"([^"]+)"/g)].map((m) => m[1]!))].map((testId) => ({ testId, verdict: judgeVerdict, why: "scripted verdict", files: judgeFiles })) };
+  }
+  if (system.includes("has been rewritten. Check the rewrite")) {
+    rewriteChecks += 1;
+    return { verdicts: [...new Set([...user.matchAll(/"testId":\s*"([^"]+)"/g)].map((m) => m[1]!))].map((testId) => ({ testId, verdict: rewriteVerdict, why: "scripted rewrite check" })) };
   }
   if (proofVerdict && system.includes("check acceptance tests before they are locked")) {
     proofCalls += 1;
@@ -161,6 +176,8 @@ const modelCalls: string[] = [];
 let planPrompt = "";
 /** the plan changes no stored data: it gives no data model even where it is shown a database */
 let planGivesNoModel = false;
+/** the stubs each plan answer gives, in order (the last repeats) */
+let planStubs: { path: string; content: string }[][] = [];
 const provider: Provider = {
   start(model, _e, system, user): Conversation {
     modelCalls.push(model);
@@ -264,6 +281,7 @@ class Lab implements ContainerRuntime {
       mkdirSync(join(src, "src/Api/openapi"), { recursive: true });
       writeFileSync(join(src, "src/Api/openapi/built.json"), this.builtDoc(src));
     }
+    if (s.cmd[1] === "build" && this.buildLog && readFileSync(join(mount("/src")!, "src/Api/Greeter.cs"), "utf8").includes("IMissing")) { this.failedBuilds++; return 1; }
     if (multi && s.cmd[1] === "build") {
       const src = mount("/src")!;
       return MULTI_FILES.some((f) => existsSync(join(src, f)) && readFileSync(join(src, f), "utf8").includes("SYNTAX")) ? 1 : 0;
@@ -306,7 +324,10 @@ class Lab implements ContainerRuntime {
     return { code: 0, stdout: "", stderr: "" };
   }
   async isRunning() { return true; }
-  async logs() { return "info: Now listening on: http://127.0.0.1:5080"; }
+  /** what a build that fails on an undeclared type prints */
+  buildLog?: string;
+  failedBuilds = 0;
+  async logs(id: string) { return this.buildLog && this.specs.get(id)?.cmd[1] === "build" ? this.buildLog : "info: Now listening on: http://127.0.0.1:5080"; }
   async stop() {}
   async remove() {}
   async listByLabel() { return []; }
@@ -330,6 +351,7 @@ async function toApproval(runId: string) {
 let lab: Lab;
 beforeEach(() => {
   planGivesNoModel = false;
+  planStubs = [];
   const home = mkdtempSync(join(tmpdir(), "factory-e2e-"));
   process.env.FACTORY_HOME = home;
   writeFileSync(join(home, ".env"), "ANTHROPIC_API_KEY=sk-ant-test-not-real-000000000000\nOPENAI_API_KEY=sk-openai-test-not-real-0000000000\n", { mode: 0o600 });
@@ -343,6 +365,8 @@ beforeEach(() => {
   setProviderFactory(() => provider);
   modelCalls.length = 0;
   multi = false;
+  unchained = false;
+  planBadShape = 0;
   planMisses = 0;
   intakeRisk = "low";
   reviewFindings = [];
@@ -352,6 +376,9 @@ beforeEach(() => {
   proofCalls = 0;
   judgeVerdict = "code";
   judgeCalls = 0;
+  judgeFiles = [];
+  rewriteVerdict = "keeps";
+  rewriteChecks = 0;
   manualCriterion = false;
   criticFindings = [];
   repairSpec = undefined;
@@ -424,12 +451,11 @@ describe("brownfield slice end to end (fakes)", () => {
     expect(modelCalls).toContain("claude-opus-5-5");
     // the ledger says which model each step was given and why: saved once with the run, then on every step and every call
     const evs = ledger.events();
-    expect((evs[0]!.data!.routes as Record<string, unknown>).critic).toMatchObject({ model: "claude-opus-5-5", source: "default", tier: "heavy" });
+    // nobody picked a model for the critic: it is off, and no call is made on its route
+    expect((evs[0]!.data!.routes as Record<string, unknown>).critic).toMatchObject({ source: "off" });
     expect((evs[0]!.data!.routes as Record<string, unknown>).implement).toMatchObject({ model: "claude-sonnet-5-5", source: "default", tier: "standard" });
     expect(evs.find((e) => e.type === "step.started" && e.key?.startsWith("intake"))!.data!.route).toMatchObject({ model: "claude-haiku-5-5", effort: "low", source: "default", tier: "light" });
-    const criticCalls = evs.filter((e) => e.type === "usage" && e.data!["factory.route"] === "critic");
-    expect(criticCalls.length).toBeGreaterThan(0);
-    for (const e of criticCalls) expect(e.data).toMatchObject({ "gen_ai.request.model": "claude-opus-5-5", "factory.route.source": "default" });
+    expect(evs.filter((e) => e.type === "usage" && e.data!["factory.route"] === "critic")).toEqual([]);
     expect(ledger.readCard(`pr-${runId}`)).toContain("AC-1.1");
     expect(ledger.readCard(`pr-${runId}`)).toContain("Security review (OWASP Top 10): nothing found");
     // the trace shows every level: steps, model turns, lab phases, containers, gates, the coding agent's actions
@@ -677,6 +703,21 @@ describe("brownfield slice end to end (fakes)", () => {
     const r = await execute(runId);
     expect(r.status).toBe("parked");
     expect(r.message).toMatch(/Safety check failed twice/);
+    // every attempt left one summary, and the checks its refused change never reached are on record with the reason
+    const events = ledger.events();
+    const sums = events.filter((e) => e.type === "attempt.summary" && e.key?.startsWith("implement/TASK-1/")).map((e) => e.data as { attempt: number; result: string; checks: { gateId: string; passed: boolean }[]; skipped: { gateId: string; reason: string }[]; decision: { action: string; ladder?: { rule: string } }; parked?: string; ms: number });
+    expect(sums.map((x) => [x.attempt, x.result])).toEqual([[1, "retry"], [2, "parked"]]);
+    expect(sums[0]!.checks.find((c) => !c.passed)?.gateId).toBe("task.lock-set-unchanged");
+    expect(sums[0]!.skipped.find((k) => k.gateId === "tests.expectations")?.reason).toMatch(/the change itself was refused first \(.*\), so the code was not built or run/);
+    expect(sums[0]!.decision).toMatchObject({ action: "retry", ladder: { rule: "safety", attempts: 1 } });
+    expect(sums[1]!).toMatchObject({ decision: { action: "park", ladder: { rule: "safety", attempts: 2 } }, parked: expect.stringMatching(/Safety check failed twice/) });
+    // each check result says which attempt it belongs to
+    expect(events.filter((e) => e.type === "gate.result" && (e.data as { step?: string }).step === "implement/TASK-1").map((e) => (e.data as { attempt?: number }).attempt)).toEqual(expect.arrayContaining([1, 2]));
+    // a step that passed has its summary too, and the summaries change nothing a re-check or a replay reads
+    expect(events.some((e) => e.type === "attempt.summary" && e.key === "author-tests/1" && (e.data as { result: string }).result === "passed")).toBe(true);
+    expect(verifyEvidence(ledger).every((c) => c.ok)).toBe(true);
+    const { explainRun } = await import("../cli/explain.js");
+    expect(explainRun(events, { step: "implement/TASK-1" })).toMatch(/attempt 2 .*→ {2}PARKED[\s\S]*rule: a safety check failed\. Attempts 2 of/);
   });
 
   it("a rejection revises the spec and plan and shows a new card; a second rejection parks", async () => {
@@ -1026,6 +1067,10 @@ describe("a .NET API held to a locked API contract (fakes)", () => {
     expect(s.gates.some((g) => g.gateId === "contract.matches" && !g.passed)).toBe(true);
     expect(s.steps.get("implement/TASK-1")?.status).not.toBe("completed");
     expect(readFileSync(join(ledger.dir, "run.log"), "utf8")).toMatch(/The API does not match the locked contract: missing in the API: GET \/api\/appointments\/today 200 body\[\]\.patient/);
+    // the check's record says how much it compared, and names the attempt
+    const failed = ledger.events().find((e) => e.type === "gate.result" && (e.data as { gateId?: string }).gateId === "contract.matches" && !(e.data as { passed?: boolean }).passed)!;
+    expect(failed.data).toMatchObject({ attempt: 1, facts: { operationsInContract: expect.any(Number), operationsInApi: expect.any(Number), differences: expect.any(Number), partial: true } });
+    expect((failed.data as { facts: { differences: number } }).facts.differences).toBeGreaterThan(0);
   });
 
   it("a build that writes no document fails the gate plainly", async () => {
@@ -1062,6 +1107,16 @@ describe("implement loop across tasks (fakes)", () => {
     expect(s.steps.get("implement/TASK-2")?.attempts).toBe(3);
     expect(s.steps.get("implement/TASK-3")?.attempts).toBe(2);
     const ids = MULTI_TESTS.map((n) => `Api.Tests::Api.Tests.GreetTests.${n}`);
+    // a task's run leaves out the locked tests of tasks not built yet; the last task has none to leave out
+    const testCmd = (k: string) => [...lab.specs.values()].find((sp) => sp.cmd[1] === "test" && sp.labels.key === k)!.cmd.join(" ");
+    expect(testCmd("implement/TASK-1/2")).toMatch(/--filter FullyQualifiedName!=Api\.Tests\.GreetTests\.AC_2_1_SaysBye&FullyQualifiedName!=Api\.Tests\.GreetTests\.AC_3_1_\w+$/);
+    // and none of them is run a second time as a "failed test worth one more run"
+    expect([...lab.specs.values()].filter((sp) => sp.cmd[1] === "test" && sp.labels.key.startsWith("implement/")).map((sp) => sp.labels.key)).toEqual(["implement/TASK-1/2", "implement/TASK-2/1", "implement/TASK-2/2", "implement/TASK-2/3", "implement/TASK-3/1", "implement/TASK-3/2-first", "implement/TASK-3/2"]);
+    expect(testCmd("implement/TASK-2/1")).toMatch(/--filter FullyQualifiedName!=Api\.Tests\.GreetTests\.AC_3_1_\w+$/);
+    expect(testCmd("implement/TASK-3/1")).not.toContain("!=");
+    // a retry on kept code runs the test that failed last time first, alone, and the whole suite once it passes
+    expect(testCmd("implement/TASK-3/2-first")).toMatch(/--filter [^!]*AC_3_1/);
+    expect(testCmd("implement/TASK-3/2")).not.toContain("--filter");
     const start = (task: string) => String(s.steps.get(task)!.data!.commit);
 
     // TASK-1: out-of-scope edit → the retry starts from the task start commit, the stray file gone
@@ -1108,6 +1163,10 @@ describe("implement loop across tasks (fakes)", () => {
     // the last task's run already required every task's locked test: integrate reuses it
     expect(s.steps.get("integrate")!.data).toMatchObject({ reusedRunFrom: "implement/TASK-3" });
     expect(verifyEvidence(ledger).every((c) => c.ok)).toBe(true);
+    // the summary of a retry says whether the last attempt's code was kept, and why
+    const kept = ledger.events().filter((e) => e.type === "attempt.summary" && e.key?.startsWith("implement/TASK-3/")).map((e) => e.data as { attempt: number; result: string; notes?: Record<string, string> });
+    expect(kept[0]).toMatchObject({ attempt: 1, result: "retry" });
+    expect(kept[1]).toMatchObject({ attempt: 2, result: "passed", notes: { previousCode: "kept", previousCodeWhy: expect.stringMatching(/failed only on locked-failed/) } });
   }, 30_000);
 
   it("a plan built in layers: a task that cannot reach its own test hands it to the last task, without parking or another paid attempt", async () => {
@@ -1140,6 +1199,23 @@ describe("implement loop across tasks (fakes)", () => {
     expect(expected("implement/TASK-1")).not.toContain(ids[0]);
     expect(expected("implement/TASK-3")).toEqual(expect.arrayContaining(ids));
     expect(readFileSync(join(ledger.dir, "run.log"), "utf8")).toMatch(/implement TASK-3: also held to the criteria of TASK-1, TASK-2/);
+  }, 30_000);
+
+  it("a plan in the wrong shape is fixed by a patch in the same attempt: the planner is not asked for the whole plan again", async () => {
+    multi = true;
+    planBadShape = 1;
+    const runId = await createRun("Greet people with Hello instead of Hi", "demo", "tester");
+    const ledger = await toApproval(runId);
+    const s = replay(ledger.events());
+    expect(s.steps.get("plan")?.attempts).toBe(1);
+    expect(failedAttempts(ledger, "plan")).toHaveLength(0);
+    expect(planPrompt).toContain("THE PLAN IS FIXED, NOT REWRITTEN");
+    expect(planPrompt).toContain("it was not accepted because its shape does not match the schema");
+    expect(planPrompt).toMatch(/The plan does not match its schema: [^\n]*tasks\.2\.plannedLoc/);
+    // the plan as sent went back with the request, and what came out is that plan with the one task put right
+    expect(planPrompt).toContain("three lines");
+    const plan = ledger.getJson<{ tasks: { id: string; plannedLoc: number }[] }>(s.steps.get("plan")!.outputs[0]!);
+    expect(plan.tasks.map((t) => [t.id, t.plannedLoc])).toEqual([["TASK-1", 3], ["TASK-2", 3], ["TASK-3", 3]]);
   }, 30_000);
 
   it("a plan that fails its checks is fixed by a patch: the retry returns only the missing task", async () => {
@@ -1300,6 +1376,146 @@ describe("implement loop across tasks (fakes)", () => {
     expect(judgeCalls).toBe(1);
   }, 30_000);
 
+  it("a refused rewrite goes back to the test writer once, and the second one is locked", async () => {
+    multi = true;
+    judgeVerdict = "test";
+    lab.edits = {
+      "src/Api/Greeter.cs": [{ "src/Api/Greeter.cs": HELLO }],
+      "src/Api/Farewell.cs": [{ "src/Api/Farewell.cs": cls("Bye") }],
+      "src/Api/Third.cs": [{ "src/Api/Third.cs": cls("Trois") }, { "src/Api/Third.cs": cls("Trois") }],
+      // the first rewrite passes on any code; sent back, the second asks for what the criterion says
+      [TEST_FILE]: [{ [TEST_FILE]: "namespace Api.Tests; public class GreetTests { /* WANTS:ANYTHING */ }\n" }, { [TEST_FILE]: "namespace Api.Tests; public class GreetTests { /* WANTS:Trois */ }\n" }],
+    };
+    const { runId, ledger } = await approved();
+    const r = await execute(runId);
+    expect(r.status, r.message).toBe("delivered");
+    const rewrites = lab.jobs.filter((j) => j.fileScope[0] === TEST_FILE) as unknown as { task: string }[];
+    expect(rewrites).toHaveLength(2);
+    expect(rewrites[0]!.task).not.toContain("Your first rewrite was not accepted");
+    expect(rewrites[1]!.task).toContain("Your first rewrite was not accepted");
+    expect(rewrites[1]!.task).toContain("already passes before any change");
+    // the second rewrite started from the test as it was locked, and only it is on the ledger
+    expect(lab.seen.filter((x) => x.scope === TEST_FILE)).toHaveLength(2);
+    const [j] = judgedIn(ledger);
+    expect(j).toMatchObject({ verdict: "test", rewritten: expect.objectContaining({ sha: expect.any(String) }) });
+    expect(j!.rejected).toBeUndefined();
+    expect(judgedIn(ledger)).toHaveLength(1);
+    expect(rewriteChecks).toBe(1);
+    expect(ledger.events().some((e) => e.type === "run.parked")).toBe(false);
+  }, 30_000);
+
+  it("a rewrite is read against the locked test, not against its criterion again: one that asserts less twice stops the run", async () => {
+    multi = true;
+    // the check before the lock would call every test weak; a rewrite is not held to it (run 1679)
+    proofVerdict = "weak";
+    judgeVerdict = "test";
+    lab.edits = {
+      "src/Api/Greeter.cs": [{ "src/Api/Greeter.cs": HELLO }],
+      "src/Api/Farewell.cs": [{ "src/Api/Farewell.cs": cls("Bye") }],
+      "src/Api/Third.cs": [{ "src/Api/Third.cs": cls("Trois") }, { "src/Api/Third.cs": cls("Trois") }],
+      [TEST_FILE]: [{ [TEST_FILE]: "namespace Api.Tests; public class GreetTests { /* WANTS:Trois */ }\n" }],
+    };
+    const { runId, ledger } = await approved();
+    const before = proofCalls;
+    const r = await execute(runId);
+    expect(r.status, r.message).toBe("delivered");
+    // the whole-test check was not asked about the rewrite; the check of the change was, once
+    expect(proofCalls - before).toBe(proofCalls - before > 0 ? proofCalls - before : 0);
+    expect(rewriteChecks).toBe(1);
+    expect(judgedIn(ledger)[0]).toMatchObject({ verdict: "test", rewritten: expect.anything() });
+
+    // and one that drops an assertion is refused, sent back once, and then the run stops with what was lost
+    proofVerdict = "proves-it";
+    rewriteVerdict = "loosened";
+    rewriteChecks = 0;
+    lab.edits[TEST_FILE] = [{ [TEST_FILE]: "namespace Api.Tests; public class GreetTests { /* WANTS:Trois */ }\n" }];
+    lab.edits["src/Api/Third.cs"] = [{ "src/Api/Third.cs": cls("Trois") }, { "src/Api/Third.cs": cls("Trois") }];
+    const second = await approved();
+    const r2 = await execute(second.runId);
+    expect(r2.status, r2.message).toBe("parked");
+    expect(r2.message).toMatch(/its rewrite was not accepted: it asserts less than the locked test did.*scripted rewrite check/);
+    expect(rewriteChecks).toBe(2);
+    expect(judgedIn(second.ledger)[0]).toMatchObject({ verdict: "test", rejected: expect.stringContaining("it asserts less than the locked test did") });
+  }, 60_000);
+
+  it("a locked test that is right but needs a later task's file opens that file to the task, and the pull request says so", async () => {
+    multi = true;
+    // the tasks do not build on each other, so a test of TASK-2 cannot wait for TASK-3: it has to pass at TASK-2
+    unchained = true;
+    judgeVerdict = "scope";
+    judgeFiles = ["src/Api/Third.cs"];
+    const SECOND_ID = "Api.Tests::Api.Tests.GreetTests.AC_2_1_SaysBye";
+    lab.edits = {
+      "src/Api/Greeter.cs": [{ "src/Api/Greeter.cs": HELLO }],
+      // the third attempt also changes TASK-3's file (run 9fcb: a screen a later task builds), which the file-scope check would refuse without the opening
+      "src/Api/Farewell.cs": [{ "src/Api/Farewell.cs": cls("By") }, { "src/Api/Farewell.cs": cls("By ") }, { "src/Api/Farewell.cs": cls("Bye"), "src/Api/Third.cs": cls("Early") }],
+      "src/Api/Third.cs": [{ "src/Api/Third.cs": cls("Three") }],
+    };
+    const { runId, ledger } = await approved();
+    const r = await execute(runId);
+    expect(r.status, r.message).toBe("delivered");
+    expect(judgedIn(ledger)).toEqual([expect.objectContaining({ step: "implement/TASK-2", testId: SECOND_ID, verdict: "scope", opened: ["src/Api/Third.cs"] })]);
+    // no test was rewritten, and only the attempt after the check may change the opened file
+    expect(lab.jobs.some((j) => j.fileScope[0] === TEST_FILE)).toBe(false);
+    const jobs2 = lab.jobs.filter((j) => j.fileScope[0] === MULTI_FILES[1]);
+    expect(jobs2.map((j) => j.fileScope.includes("src/Api/Third.cs"))).toEqual([false, false, true]);
+    const t2 = lab.seen.filter((x) => x.scope === MULTI_FILES[1]);
+    expect(t2[2]!.task).toContain("are right, but they could not pass with this task's own files");
+    expect(t2[2]!.task).toContain(`- ${SECOND_ID} (AC-2.1): src/Api/Third.cs. scripted verdict`);
+    const s = replay(ledger.events());
+    const commit = String(s.steps.get("implement/TASK-2")!.data!.commit);
+    expect(execFileSync("git", ["show", `${commit}:src/Api/Third.cs`], { cwd: s.info.repoPath!, encoding: "utf8" })).toBe(cls("Early"));
+    // the later task builds on it
+    expect(execFileSync("git", ["show", `${s.steps.get("implement/TASK-3")!.data!.commit}:src/Api/Third.cs`], { cwd: s.info.repoPath!, encoding: "utf8" })).toBe(cls("Three"));
+    expect(ledger.readCard(`pr-${runId}`)).toContain("File opened to another task during the build: `src/Api/Third.cs` was changed by TASK-2");
+    expect(ledger.events().some((e) => e.type === "run.parked")).toBe(false);
+    expect(verifyEvidence(ledger).every((c) => c.ok)).toBe(true);
+  }, 30_000);
+
+  it("a file no task of the plan lists does not open: the run stops for a person, and goes on with the test as it is", async () => {
+    multi = true;
+    judgeVerdict = "scope";
+    judgeFiles = ["src/Api/Extra.cs", TEST_FILE];
+    lab.edits = {
+      "src/Api/Greeter.cs": [{ "src/Api/Greeter.cs": HELLO }],
+      "src/Api/Farewell.cs": [{ "src/Api/Farewell.cs": cls("Bye") }],
+      "src/Api/Third.cs": [{ "src/Api/Third.cs": cls("Thre") }, { "src/Api/Third.cs": cls("Thre ") }, { "src/Api/Third.cs": cls("Three") }],
+    };
+    const { runId, ledger } = await approved();
+    const r = await execute(runId);
+    expect(r.status, r.message).toBe("parked");
+    expect(r.message).toMatch(/the test is right but needs a file this task may not change.*src\/Api\/Extra\.cs \(no task of the plan lists it\)/);
+    expect(judgedIn(ledger)[0]).toMatchObject({ verdict: "scope", rejected: expect.stringContaining("(locked)") });
+    expect(judgedIn(ledger)[0]!.opened).toBeUndefined();
+    const r2 = await execute(runId);
+    expect(r2.status, r2.message).toBe("delivered");
+    expect(judgeCalls).toBe(1);
+    expect(lab.jobs.some((j) => j.fileScope.includes("src/Api/Extra.cs") || (j.fileScope[0] !== TEST_FILE && j.fileScope.includes(TEST_FILE)))).toBe(false);
+  }, 30_000);
+
+  it("a test said to need a file the task may already change is the code's fault: the task goes on", async () => {
+    multi = true;
+    judgeVerdict = "scope";
+    // TASK-3 is built on TASK-1, so after a locked failure its file is open to it already
+    judgeFiles = ["src/Api/Greeter.cs"];
+    lab.edits = {
+      "src/Api/Greeter.cs": [{ "src/Api/Greeter.cs": HELLO }],
+      "src/Api/Farewell.cs": [{ "src/Api/Farewell.cs": cls("Bye") }],
+      "src/Api/Third.cs": [{ "src/Api/Third.cs": cls("Thre") }, { "src/Api/Third.cs": cls("Thre ") }, { "src/Api/Third.cs": cls("Three") }],
+    };
+    const { runId, ledger } = await approved();
+    const r = await execute(runId);
+    expect(r.status, r.message).toBe("delivered");
+    expect(judgedIn(ledger)).toEqual([expect.objectContaining({ verdict: "code", why: expect.stringContaining("already in this task's file scope") })]);
+    // the second attempt kept the code: its failed test ran alone, still failed, and the rest of the suite was not run
+    const testKeys = [...lab.specs.values()].filter((sp) => sp.cmd[1] === "test").map((sp) => sp.labels.key);
+    expect(testKeys).toContain("implement/TASK-3/2-first");
+    expect(testKeys).not.toContain("implement/TASK-3/2");
+    expect(testKeys).toEqual(expect.arrayContaining(["implement/TASK-3/3-first", "implement/TASK-3/3"]));
+    expect(readFileSync(join(ledger.dir, "run.log"), "utf8")).toMatch(/implement TASK-3: 1 of the 1 locked test\(s\) that failed last time still fail; the rest of the suite was not run/);
+    expect(ledger.readCard(`pr-${runId}`)).not.toContain("File opened to another task");
+  }, 30_000);
+
   it("two broken builds in a row climb the ladder instead of parking as a suspect test", async () => {
     multi = true;
     lab.edits = {
@@ -1409,11 +1625,13 @@ describe("light and full lanes (fakes)", () => {
 });
 
 describe("spec repairs", () => {
+  // the repairs answer the critic: these runs pick its model, which turns it on
+  const CRITIC_ON = { models: { picks: { critic: "claude-opus-5-5" } } };
   const finding = { rubric: 2, reqId: "REQ-1", severity: "high", finding: "No path for an empty name." };
   it("stops repairing when a repair leaves the same findings, instead of paying for all 3", async () => {
     intakeRisk = "medium";
     criticFindings = [finding];
-    const ledger = await toApproval(await createRun("Greet people with Hello instead of Hi", "demo", "tester"));
+    const ledger = await toApproval(await createRun("Greet people with Hello instead of Hi", "demo", "tester", CRITIC_ON));
     const s = replay(ledger.events());
     expect(s.steps.get("specify")!.data).toMatchObject({ repairs: 1, lane: "full" });
     expect(repairCalls).toBe(1);
@@ -1433,7 +1651,7 @@ describe("spec repairs", () => {
     criticFindings = [finding];
     const file = join(process.env.FACTORY_HOME!, "projects", "demo.yaml");
     writeFileSync(file, stringify({ ...parse(readFileSync(file, "utf8")), brownfield: { questions: true } }));
-    const ledger = await toApproval(await createRun("Greet people with Hello instead of Hi", "demo", "tester"));
+    const ledger = await toApproval(await createRun("Greet people with Hello instead of Hi", "demo", "tester", CRITIC_ON));
     const s = replay(ledger.events());
     expect(s.info.asks).toBe(true);
     // with none to ask, the finding is carried as an open risk and the plan approval card states it
@@ -1451,7 +1669,7 @@ describe("spec repairs", () => {
     settleAsks = true;
     const file = join(process.env.FACTORY_HOME!, "projects", "demo.yaml");
     writeFileSync(file, stringify({ ...parse(readFileSync(file, "utf8")), brownfield: { questions: true } }));
-    const ledger = await toApproval(await createRun("Greet people with Hello instead of Hi", "demo", "tester"));
+    const ledger = await toApproval(await createRun("Greet people with Hello instead of Hi", "demo", "tester", CRITIC_ON));
     const q = replay(ledger.events()).openCard!;
     expect(q.cardId).toMatch(/^spec-questions-1-/);
     criticFindings = [];
@@ -1474,7 +1692,7 @@ describe("spec repairs", () => {
     const base = answerFor("Senior engineer writing a behaviour spec") as { requirements: { acceptance: { then: string }[] }[] };
     // the repair returns one changed requirement (no nfrs, no lists) whose Then fails the observable check
     repairSpec = { requirements: base.requirements.map((r) => ({ ...r, acceptance: r.acceptance.map((a) => ({ ...a, then: "it works" })) })) };
-    const runId = await createRun("Greet people with Hello instead of Hi", "demo", "tester");
+    const runId = await createRun("Greet people with Hello instead of Hi", "demo", "tester", CRITIC_ON);
     await execute(runId);
     const ledger = Ledger.open(runId);
     const q = replay(ledger.events()).openCard!;
@@ -1495,7 +1713,7 @@ describe("spec repairs", () => {
     criticFindings = [finding];
     const base = answerFor("Senior engineer writing a behaviour spec") as { requirements: { sources: string[] }[]; outOfScope: string[] };
     repairSpec = { ...base, requirements: base.requirements.map((r) => ({ ...r, sources: ["Q-1"] })), outOfScope: ["I-1 greeting change, deferred to run 2"] };
-    const ledger = await toApproval(await createRun("Greet people with Hello instead of Hi", "demo", "tester"));
+    const ledger = await toApproval(await createRun("Greet people with Hello instead of Hi", "demo", "tester", CRITIC_ON));
     const s = replay(ledger.events());
     expect(s.steps.get("specify")!.data).toMatchObject({ repairs: 1, rejectedRepair: ["I-1"] });
     expect(repairCalls).toBe(1);
@@ -1651,4 +1869,26 @@ describe("from a Jira label to a reviewed pull request (fakes: models, container
     expect(err).not.toContain(auth);
     expect(err).not.toContain(token);
   });
+});
+
+describe("the plan's stubs are built before approval", () => {
+  it("a stub that does not compile goes back to the planner, not on to the test writer (run 2bf7)", async () => {
+    const broken = "namespace Api; public class Greeter : IMissing { public string Greet(string name) => throw new System.NotImplementedException(); }\n";
+    planStubs = [[{ path: "src/Api/Greeter.cs", content: broken }], [{ path: "src/Api/Greeter.cs", content: GREETER }]];
+    lab.buildLog = "/src/src/Api/Greeter.cs(1,37): error CS0246: The type or namespace name 'IMissing' could not be found (are you missing a using directive or an assembly reference?) [/src/src/Api/Api.csproj]";
+    const runId = await createRun("Greet people with Hello instead of Hi", "demo", "tester");
+    const ledger = await toApproval(runId);
+    const failed = ledger.events().filter((e) => e.type === "step.failed" && String(e.key).startsWith("plan"));
+    expect(failed).toHaveLength(1);
+    const said = JSON.stringify(ledger.getJson(failed[0]!.outputs![0]!));
+    expect(said).toContain("plan-stub-build");
+    expect(said).toContain("CS0246");
+    expect(said).toContain("src/Api/Greeter.cs:1");
+    expect(lab.failedBuilds).toBe(1);
+    // the plan that reached the approval card is the one whose stubs compile
+    const s = replay(ledger.events());
+    expect(s.openCard!.kind).toBe("approval");
+    const plan = ledger.getJson<{ stubs: { content: string }[] }>(s.steps.get("plan")!.outputs[0]!);
+    expect(plan.stubs.map((x) => x.content)).toEqual([GREETER]);
+  }, 30_000);
 });
