@@ -67,7 +67,9 @@ export interface RunInfo {
   /** `factory start --file`: the file the request came from */
   requestFile?: string;
   /** where the request came from: typed prompt, file, Jira ticket */
-  sources?: { kind: "prompt" | "file" | "jira" | "docx" | "pdf" | "frames"; name?: string; key?: string; url?: string; summary?: string }[];
+  sources?: { kind: "prompt" | "file" | "jira" | "docx" | "pdf" | "frames" | "transcript"; name?: string; key?: string; url?: string; summary?: string }[];
+  /** a Google Meet transcript request: the parsed transcript's artifact; the distill step reads it, and its approved brief replaces `request` */
+  transcriptSha?: string;
   /** design references the user attached (R-1, R-2, ...), read at intake; their pictures are ledger artifacts */
   references?: Reference[];
   versions?: Record<string, string>;
@@ -99,6 +101,10 @@ export interface RunInfo {
   designExport?: string[];
   /** `--ui-target`: the stack the approved design is built in when the project sets none (docs/estimates-design.md, "Kit and scaffold") */
   uiTarget?: "next-shadcn" | "vite-shadcn" | "repo";
+  /** `--mobile-design` or the start form: whether a Stitch or pages design draws its main pages at phone width too; over the project's design.stitch.phone. Set at the start, so a run keeps what it began with */
+  mobileDesign?: boolean;
+  /** a request specified per module (src/stages/modular.ts, moduleView): the whole request, and whether this is the first module. Only in that view, never stored */
+  moduleOf?: { request: string; first: boolean };
   /**
    * a build that settles its spec problems and failing design checks by questions and reads a large request per module, as an
    * estimate does (src/estimate/settled.ts, settles): every greenfield run, and a brownfield run whose project turns
@@ -232,6 +238,8 @@ export function replay(events: LedgerEvent[]): RunState {
         // the cost cap depends on these: class from intake, size from plan
         if (typeof data.changeClass === "string") s.info.changeClass = data.changeClass as ChangeClass;
         if (typeof data.complexity === "string") { s.info.complexity = data.complexity as Complexity; s.info.spendAtPlan = s.costUsd; }
+        // a transcript run: the approved client intent's brief is the request every later step reads (transcript-intent spec §2)
+        if (step === "distill" && typeof data.brief === "string") s.info.request = data.brief;
         stopped(step);
         closeActive(ev.ts);
         break;

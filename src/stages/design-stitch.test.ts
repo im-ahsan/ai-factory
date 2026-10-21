@@ -29,6 +29,10 @@ const plan = (over: Record<string, unknown> = {}) => ({
   ],
   noScreen: [], brand: { colours: ["#0F766E"], fonts: [] }, ...over,
 });
+const withOverlays = () => plan({ screens: [{ ...plan().screens[0], states: ["empty"], phone: true, overlays: [
+  { kind: "modal", title: "Add payee", trigger: "Add payee", content: "Name, bank and IBAN fields; Save payee and Cancel." },
+  { kind: "confirm", title: "Delete payee", trigger: "Delete", content: "Says the payee and their history are removed for good." },
+] }, plan().screens[1]] });
 const md = (brand = "#0F766E") => `# Design System: Payees\n## 1. Visual Theme & Atmosphere\nCalm, balanced, a daily banking app with clear hierarchy and quiet surfaces throughout.\n## 2. Color Palette & Roles\n- **Canvas** (#F9FAFB) — background\n- **Brand Teal** (${brand}) — the one accent\n## 3. Typography Rules\n- **Display:** Geist\n## 4. Component Stylings\nFlat buttons.\n## 5. Layout Principles\nGrid first.\n## 7. Anti-Patterns (Banned)\n- No emojis`;
 
 let answers: unknown[] = [];
@@ -201,6 +205,10 @@ describe("the stitch design artifact", () => {
     // the design keeps the prompt as drawn, so a state drawn again after a send-back is told the same
     expect(stitchArtifact(shared as never, [], { projectId: "p", model: "m", designMd: "m" }, ["REQ-1", "REQ-2"]).stitch.prompts["S-1"]).toContain("The page's header");
     expect(withShared(plan({ shells: [], sample: "" }) as never).screens[0]!.prompt).toBe(plan().screens[0]!.prompt);
+    // the design keeps the product's name and each page's kind of user, for the app's frame (run 4049 read the repo name and listed every page to everyone)
+    const body = stitchArtifact({ ...shared, product: " Payees Online " } as never, [], { projectId: "p", model: "m", designMd: "m" }, ["REQ-1", "REQ-2"]);
+    expect(body.product).toBe("Payees Online");
+    expect(body.screens.map((s) => s.user)).toEqual(["customer", undefined]);
   });
 
   it("tells Stitch the words of each link the screen list gave, and keeps where each leads for the live demo", () => {
@@ -360,6 +368,88 @@ describe("extra states", () => {
   });
 });
 
+describe("overlays", () => {
+  it("draws each overlay once as a frame of its page, after its states and before its phone drawing", () => {
+    const jobs = stitchJobs(withOverlays().screens as never, ["empty"], undefined, true);
+    expect(jobs.filter((j) => j.id === "S-1").map((j) => j.state)).toEqual(["normal", "empty", "overlay-1", "overlay-2", "phone"]);
+    const modal = jobs.find((j) => j.state === "overlay-1")!;
+    expect(modal.prompt).toContain('the dialog "Add payee" open over it, as the "Add payee" control opens it');
+    expect(modal.prompt).toContain("It holds: Name, bank and IBAN fields; Save payee and Cancel.");
+    expect(modal.prompt).toContain("Keep the layout, navigation and header of the page behind identical to the normal page.");
+    expect(jobs.find((j) => j.state === "overlay-2")!.prompt).toContain('the confirmation dialog "Delete payee"');
+    // an overlay has no state or phone drawing of its own
+    expect(jobs.filter((j) => j.state.startsWith("overlay-"))).toHaveLength(2);
+  });
+
+  it("tells the screen list to keep popups on their page and not to invent screens", async () => {
+    answers = [plan(), { designMd: md(), theme }];
+    await drawWithStitch(ctxFor(memoryLedger()), spec);
+    const listCall = systems[0] + users[0];
+    expect(listCall).toContain("Do not invent screens the requirements do not need.");
+    expect(listCall).toContain('"overlays" lists what opens over this page instead of a page of its own');
+    expect(listCall).not.toContain("(sign in, a confirmation, a message that access is refused)");
+  });
+
+  it("refuses a screen list with two overlays of the same title on one page", async () => {
+    const o = { kind: "modal", title: "Add payee", trigger: "Add payee", content: "Name, bank and IBAN fields; Save payee and Cancel." };
+    answers = [plan({ screens: [{ ...plan().screens[0], overlays: [o, { ...o, trigger: "New payee" }] }, plan().screens[1]] })];
+    const out = await drawWithStitch(ctxFor(memoryLedger()), spec);
+    expect(out).toMatchObject({ kind: "fail", failures: [expect.objectContaining({ check: "design-duplicate-overlay" })] });
+  });
+
+  it("keeps each screen's overlays in the design, with their frames after its states", async () => {
+    answers = [withOverlays(), { designMd: md(), theme }];
+    const ledger = memoryLedger();
+    const out = await drawWithStitch(ctxFor(ledger, 0, { stitch: { phone: false } }), spec);
+    const d = ledger.getJson<{ screens: { id: string; frames: string[]; overlays?: { kind: string; title: string; trigger: string }[] }[]; stitch: { frames: Record<string, { state: string }> } }>((out as { outputs: { design: string } }).outputs.design);
+    const s1 = d.screens.find((s) => s.id === "S-1")!;
+    expect(s1.frames.map((f) => d.stitch.frames[f]!.state)).toEqual(["normal", "empty", "overlay-1", "overlay-2"]);
+    expect(s1.overlays).toEqual([
+      { kind: "modal", title: "Add payee", trigger: "Add payee", content: "Name, bank and IBAN fields; Save payee and Cancel." },
+      { kind: "confirm", title: "Delete payee", trigger: "Delete", content: "Says the payee and their history are removed for good." },
+    ]);
+    expect(d.screens.find((s) => s.id === "S-2")!.overlays).toBeUndefined();
+  });
+
+  it("keeps a patched screen's overlays and edits each in place", async () => {
+    const ledger = memoryLedger();
+    answers = [withOverlays(), { designMd: md(), theme }];
+    const out = await drawWithStitch(ctxFor(ledger, 0, { stitch: { phone: false } }), spec);
+    const prev = ledger.getJson((out as { outputs: { design: string } }).outputs.design);
+    made = { projects: [], systems: [], generated: [], edits: [], closed: 0 };
+    answers = [{ redraw: false, screens: [{ id: "S-1", change: "Make the IBAN column wider." }] }];
+    const again = await drawWithStitch(ctxFor(ledger, 0, { stitch: { phone: false } }), spec, { previous: prev as never, feedback: ["The IBAN column is too narrow."] });
+    const d = ledger.getJson<{ screens: { id: string; overlays?: unknown[] }[] }>((again as { outputs: { design: string } }).outputs.design);
+    expect(d.screens.find((s) => s.id === "S-1")!.overlays).toHaveLength(2);
+    // its normal page, its empty state and its two overlays: each edited, none drawn again
+    expect(made.edits.map((e) => e.prompt)).toEqual(Array(4).fill(expect.stringContaining("Make the IBAN column wider.")));
+    expect(made.generated).toEqual([]);
+  });
+});
+
+describe("mobile design per run", () => {
+  const withRun = (ctx: StepContext, mobileDesign: boolean): StepContext => ({ ...ctx, state: replay([{ ...(CREATED as object), data: { ...(CREATED as { data: object }).data, mobileDesign } } as never]) });
+  const phones = () => plan({ screens: plan().screens.map((x) => ({ ...x, phone: true, states: [] })) });
+
+  it("the run's choice beats the project's", async () => {
+    answers = [phones(), { designMd: md(), theme }];
+    await drawWithStitch(withRun(ctxFor(memoryLedger(), 0, { stitch: { phone: true } }), false), spec);
+    expect(made.generated.map((g) => g.device)).toEqual(["DESKTOP", "DESKTOP"]);
+
+    made = { projects: [], systems: [], generated: [], edits: [], closed: 0 };
+    answers = [phones(), { designMd: md(), theme }];
+    await drawWithStitch(withRun(ctxFor(memoryLedger(), 0, { stitch: { phone: false } }), true), spec);
+    expect(made.generated.map((g) => g.device).sort()).toEqual(["DESKTOP", "DESKTOP", "MOBILE", "MOBILE"]);
+  });
+
+  it("follows the project, then on, when the run says nothing", async () => {
+    const { phoneViews } = await import("./design-stitch.js");
+    expect(phoneViews(ctxFor(memoryLedger()))).toBe(true);
+    expect(phoneViews(ctxFor(memoryLedger(), 0, { stitch: { phone: false } }))).toBe(false);
+    expect(phoneViews(withRun(ctxFor(memoryLedger(), 0, { stitch: { phone: false } }), true))).toBe(true);
+  });
+});
+
 describe("the approval preview's frames", () => {
   it("lists an image frame too large to embed, but not a missing or non-image one", async () => {
     const { previewFrames } = await import("./design-approve.js");
@@ -398,6 +488,42 @@ describe("rework of a Stitch design", () => {
     expect(d.stitch.projectId).toBe(prev.stitch.projectId);
     expect(d.revision).toBe(1);
     expect(d.rework?.[0]?.patched).toEqual(["S-2"]);
+  });
+
+  it("a new colour scheme edits every page in place and becomes the design's look (run e220 redrew the whole design)", async () => {
+    const ledger = memoryLedger();
+    const prev = await first(ledger);
+    const change = "Use #1D4ED8 for buttons, links and the selected menu item, white backgrounds and #0F172A text.";
+    answers = [{ redraw: false, screens: [], look: { customColor: "#1D4ED8", canvas: "#FFFFFF", ink: "#0F172A", change } }];
+    const out = await drawWithStitch(ctxFor(ledger), spec, { feedback: ["Colour scheme: blue and white, primary #1D4ED8."], previous: prev as never });
+    expect(out.kind).toBe("done");
+    // S-1's page and empty state, S-2's page: each edited with the change, nothing drawn again
+    expect(made.edits.map((e) => e.prompt)).toEqual(Array(3).fill(expect.stringContaining(change)));
+    expect(made.edits[0]!.prompt).toContain("Keep everything else on the page as it is");
+    expect(made.generated).toEqual([]);
+    expect(made.projects).toEqual([]);
+    const d = ledger.getJson<D & { theme: { brand: string }; stitch: { theme: { customColor: string } } }>((out as { outputs: { design: string } }).outputs.design);
+    expect(d.theme.brand).toBe("#1D4ED8");
+    expect(d.stitch.theme.customColor).toBe("#1D4ED8");
+    expect(d.rework?.[0]?.patched).toEqual(["S-1", "S-2"]);
+  });
+
+  it("a new page is drawn on its own, linked from the page that opens it, and the rest is kept", async () => {
+    const ledger = memoryLedger();
+    const prev = await first(ledger);
+    answers = [{ redraw: false, screens: [], add: [{ title: "Sign up", route: "/sign-up", file: "app/sign-up/page.tsx", reqs: ["REQ-1"], prompt: "A sign-up form: name, email and password; Sign up.", from: [{ id: "S-1", label: "Create an account" }] }] }];
+    const out = await drawWithStitch(ctxFor(ledger), spec, { feedback: ["Add a sign-up page, linked from the payees list."], previous: prev as never });
+    expect(out.kind).toBe("done");
+    expect(made.generated).toHaveLength(1);
+    expect(made.generated[0]!.prompt).toContain("A sign-up form");
+    // S-1's page and empty state get the control; S-2 is untouched
+    expect(made.edits).toHaveLength(2);
+    expect(made.edits[0]!.prompt).toContain(`"Create an account"`);
+    const d = ledger.getJson<D & { screens: { id: string; route: string }[]; stitch: { links: Record<string, { label: string; to: string }[]> } }>((out as { outputs: { design: string } }).outputs.design);
+    expect(d.screens.map((s) => [s.id, s.route])).toEqual([["S-1", "/payees"], ["S-2", "/payees/new"], ["S-3", "/sign-up"]]);
+    expect(d.stitch.links["S-1"]).toContainEqual({ label: "Create an account", to: "S-3" });
+    const s2 = (x: D) => Object.values(x.stitch.frames).filter((f) => f.screen === "S-2");
+    expect(s2(d)).toEqual(s2(prev));
   });
 
   it("redraws the whole design when the triage says so", async () => {
@@ -605,6 +731,13 @@ describe("accessibility of Stitch screens", () => {
     answers = [plan({ brand: { colours: ["#18181B"], fonts: [] } }), { designMd: md(), theme }];
     await drawWithStitch(ctxFor(memoryLedger()), bank);
     expect(systems.join("\n") + users.join("\n")).toContain("Design references (how real products");
+  });
+
+  it("takes a colour the lead's send-back gives as the brand (run e220)", async () => {
+    const bank = { requirements: [{ id: "REQ-1", ears: "The system shall list the bank account's payees with their IBAN." }, { id: "REQ-2", ears: "The system shall add a payee for a bank transfer." }] } as never;
+    answers = [plan({ brand: { colours: ["#1D4ED8"], fonts: [] } }), { designMd: md(), theme }];
+    await drawWithStitch(ctxFor(memoryLedger()), bank, { feedback: ["Colour scheme: blue and white, primary #1D4ED8."] });
+    expect(systems.join("\n") + users.join("\n")).not.toContain("Design references (how real products");
   });
 
   it("goes on with a note when no browser can check", async () => {

@@ -2,7 +2,7 @@
 // The product's frame (theme.shell): a sidebar app, a top-bar site, a menu button opening a drawer, a bottom tab bar
 // (phone apps) or a minimal frame. A sidebar becomes a drawer on a phone.
 import { Check, ChevronsUpDown, Languages, Menu } from "lucide-react";
-import { type ReactNode } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
@@ -11,12 +11,15 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useLang, useT } from "@/lib/i18n";
 import { Link, useNav } from "@/lib/nav";
 import { hrefFor, matches } from "@/lib/routes";
+import { getSessionRole } from "@/lib/session-role";
 import { cn } from "@/lib/utils";
 
 export type Shell = "sidebar" | "topbar" | "drawer" | "tabs" | "minimal";
-export interface NavItem { label: string; route: string; group?: string }
+/** `roles`: the kinds of user the page is for (absent: everyone) */
+export interface NavItem { label: string; route: string; group?: string; roles?: string[] }
 export interface Switcher { kind: string; current: string; meta?: string; others: string[] }
-export interface FrameApp { id: string; name: string; shell: Shell; nav: NavItem[]; switcher?: Switcher; routes: string[] }
+/** auth: the sign-in and sign-up routes, shown without the frame (the page draws its own brand) */
+export interface FrameApp { id: string; name: string; shell: Shell; nav: NavItem[]; switcher?: Switcher; routes: string[]; auth?: string[] }
 
 function Brand({ name }: { name: string }) {
   return <span className="flex items-center gap-2 font-heading font-semibold"><span className="flex size-7 items-center justify-center rounded-md bg-primary text-sm text-primary-foreground">{name[0]}</span>{name}</span>;
@@ -53,6 +56,7 @@ function LangSwitch() {
 function NavList({ items, path, vertical }: { items: NavItem[]; path: string; vertical: boolean }) {
   const t = useT();
   const groups = [...new Set(items.map((i) => i.group ?? ""))];
+  if (!items.length) return null;
   return (
     <nav aria-label={t("Main")} className={cn(vertical ? "grid gap-4" : "flex items-center gap-1")}>
       {groups.map((g) => (
@@ -73,11 +77,19 @@ export function AppFrame({ product, apps, children }: { product: string; apps: F
   const { path } = useNav();
   const app = apps.find((a) => a.routes.some((r) => matches(r, path))) ?? apps[0]!;
   const name = apps.length > 1 ? app.name : product;
+  // each page is listed for its own kinds of user: the signed-in person's (stored at sign-in), else the shown page's (signed out,
+  // a fixture preview); sign-in and pages for everyone list only what is for everyone
+  const [role, setRole] = useState<string | null>(null);
+  useEffect(() => { setRole(getSessionRole()); }, [path]);
+  const here = app.nav.find((i) => matches(i.route, path))?.roles;
+  const nav = app.nav.filter((i) => !i.roles || (role ? i.roles.includes(role) : !!here?.some((r) => i.roles!.includes(r))));
+  // signing in or up: no frame and no links, so nothing prefetches a signed-in page while signed out
+  if (app.auth?.some((r) => matches(r, path))) return <TooltipProvider delayDuration={300}>{children}<Toaster /></TooltipProvider>;
   const side = (
     <div className="grid content-start gap-4">
       <Brand name={name} />
       {app.switcher && <SwitcherMenu s={app.switcher} />}
-      <NavList items={app.nav} path={path} vertical />
+      <NavList items={nav} path={path} vertical />
       <div><LangSwitch /></div>
     </div>
   );
@@ -101,12 +113,12 @@ export function AppFrame({ product, apps, children }: { product: string; apps: F
     <div className="flex min-h-dvh flex-col pb-16">
       <header className="flex items-center gap-2 border-b bg-card px-4 py-2"><Brand name={name} /><span className="ms-auto"><LangSwitch /></span></header>
       {children}
-      <nav aria-label={t("Main")} className="fixed inset-x-0 bottom-0 z-40 flex border-t bg-card">
-        {app.nav.slice(0, 5).map((i) => {
+      {nav.length > 0 && <nav aria-label={t("Main")} className="fixed inset-x-0 bottom-0 z-40 flex border-t bg-card">
+        {nav.slice(0, 5).map((i) => {
           const on = matches(i.route, path);
           return <Link key={i.route} to={hrefFor(i.route)} aria-current={on ? "page" : undefined} className={cn("flex-1 py-3 text-center text-xs", on ? "font-medium text-primary" : "text-muted-foreground")}>{t(i.label)}</Link>;
         })}
-      </nav>
+      </nav>}
     </div>
   );
   else if (app.shell === "minimal") frame = (
@@ -115,9 +127,9 @@ export function AppFrame({ product, apps, children }: { product: string; apps: F
   else frame = (
     <div className="flex min-h-dvh flex-col">
       <header className="sticky top-0 z-40 flex items-center gap-4 border-b bg-card px-4 py-2">
-        <span className={app.shell === "drawer" ? "" : "md:hidden"}>{drawer}</span>
+        {(nav.length > 0 || app.switcher) && <span className={app.shell === "drawer" ? "" : "md:hidden"}>{drawer}</span>}
         <Brand name={name} />
-        {app.shell === "topbar" && <div className="hidden md:block"><NavList items={app.nav} path={path} vertical={false} /></div>}
+        {app.shell === "topbar" && <div className="hidden md:block"><NavList items={nav} path={path} vertical={false} /></div>}
         <span className="ms-auto"><LangSwitch /></span>
         {app.switcher && <div className="hidden w-56 sm:block"><SwitcherMenu s={app.switcher} /></div>}
       </header>

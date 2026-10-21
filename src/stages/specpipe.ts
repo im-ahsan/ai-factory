@@ -14,10 +14,11 @@ import { LANE, lightSpec, specLane } from "./lane.js";
 import { settles, specRefused, unsettled, type Found } from "../estimate/settled.js";
 import { settle, settledAnswers, settleKey, type Answer, type Decided } from "./settle.js";
 import { hashJson } from "../util/hash.js";
-import { repoIsEmpty } from "../config/greenfield.js";
+import { repoIsEmpty, startsNewProduct } from "../config/greenfield.js";
 import { testsScreens } from "./stack-text.js";
 import { apiElsewhere } from "./contract.js";
-import { lightLaneModel } from "./routing.js";
+import { lightLaneModel, stepOff } from "./routing.js";
+import { accountsDefault, accountsProblems, ACCOUNTS_ID } from "./accounts.js";
 
 type Intent = z.infer<typeof IntentBody>;
 type CB = z.infer<typeof CurrentBehaviourBody>;
@@ -196,6 +197,13 @@ const nothingToRead = (ctx: Pick<StepContext, "state">): boolean => {
 const newWork = (ctx: Pick<StepContext, "state">): boolean => !hasRepo(ctx) || nothingToRead(ctx);
 /** The web side of a full-stack product writing its own spec. An estimate prices the whole request, so its spec keeps every criterion. */
 const webSide = (ctx: Pick<StepContext, "state" | "project">): boolean => ctx.state.info.mode !== "estimate" && apiElsewhere(ctx.project);
+/**
+ * The spec's screens get tests: a web app with screen tests, or an estimate that draws a design. That estimate's spec seeds the
+ * web build of its design, and written for a lab that can't test screens it had no ui criteria (run 3f0f: 0 ui, 2 locked tests
+ * for 20 tasks and 17 screens).
+ */
+const screensTested = (ctx: Pick<StepContext, "state" | "project">): boolean =>
+  testsScreens(ctx.project) || (ctx.state.info.mode === "estimate" && ctx.state.info.estimate?.drawDesign !== false);
 /** Spans a repair dropped; one the API side took over (webSideOnly) is not dropped. */
 const lostHere = (before: Spec, after: Spec, spans: string[]): string[] => {
   const apis = outOfScopeSpans(after.outOfScope, spans, [API_SIDE]);
@@ -219,7 +227,20 @@ function inputsOf(ctx: StepContext) {
   const intent = requireOutput<Intent>(ctx.state, ctx.ledger, "intake");
   const cb = requireOutput<CB>(ctx.state, ctx.ledger, "ground");
   const c = clarifications(readOutput<ClarifyResult>(ctx.state, ctx.ledger, "clarify"), readOutput<ClarifyResult>(ctx.state, ctx.ledger, "clarify-2"));
-  return { intent, cb, ...c };
+  const accounts = accountsFor(ctx);
+  return { intent, cb, ...c, ...(accounts ? { answers: [...c.answers, accounts] } : {}) };
+}
+
+/**
+ * A new product's sign-up and log-in, as the factory's answer (src/stages/accounts.ts): read from the whole request, and in a
+ * request specified per module given to the first module alone, so the product has one sign-up, not one per module.
+ */
+function accountsFor(ctx: Pick<StepContext, "state">): Answer | undefined {
+  const m = ctx.state.info.moduleOf;
+  // a new product: no repo, an empty one, or the factory's own skeleton (a full-stack product's API repo)
+  const fresh = !hasRepo(ctx) || startsNewProduct(ctx.state.info.repoPath!, ctx.state.info.baseCommit!);
+  if (!fresh || (m && !m.first)) return undefined;
+  return accountsDefault(m?.request ?? request(ctx));
 }
 
 const draftRules = (screens: boolean, newWork = false, apiSide = false): string => `Senior engineer writing a behaviour spec a test author can turn into black-box tests.
@@ -244,12 +265,13 @@ ${UNTRUSTED_NOTE}`;
 
 function draftSections(ctx: StepContext, i: ReturnType<typeof inputsOf>) {
   return [
-    S.template("tpl", draftRules(testsScreens(ctx.project.stack), newWork(ctx), webSide(ctx))),
+    S.template("tpl", draftRules(screensTested(ctx), newWork(ctx), webSide(ctx))),
     S.artifact("intent", "intent", i.intent),
     S.artifact("answers", "answers", i.answers),
     S.artifact("assumptions", "assumptions", i.assumptions),
     S.artifact("cb", "current-behaviour", i.cb),
     S.untrusted("request", "cli", request(ctx)),
+    ...(i.answers.some((a) => a.id === ACCOUNTS_ID) ? [S.template("accounts", `The product has user accounts (answer ${ACCOUNTS_ID}): write its sign-up, log-in and log-out as requirements with their criteria, citing ${ACCOUNTS_ID} in sources, and the refusal of what needs a login without one. They are decided, not a capability you added.`)] : []),
     // a guided run: what the person corrected on the "what I understood" card
     ...(correction(ctx.state) ? [{ spec: { id: "correction", source: "feedback" as const, trust: "trusted" as const, placement: "user" as const }, content: `Before the spec was written, the requester read what was understood (the answers and assumptions above) and corrected it. Where this differs from an assumption, this wins:\n${correction(ctx.state)}` }] : []),
   ];
@@ -311,6 +333,9 @@ ${OBSERVABLE_RULE} Reword a draft's Then that doesn't, without changing what it 
   },
 };
 
+/** What the cards say in place of findings when the critic did not run. */
+export const CRITIC_OFF = "The critic was off for this run: pick a model for the critic step at the start to turn it on.";
+
 export interface Checks { lint: LintResult[]; critic: z.infer<typeof CriticOut>["findings"]; roundTrip: { droppedSpans: string[]; inventedCapabilities: string[] }; criticNote?: string }
 
 async function checkSpec(ctx: StepContext, spec: Spec, i: ReturnType<typeof inputsOf>, criticEffort?: "low" | "medium" | "high"): Promise<{ ok: true; checks: Checks } | { ok: false; outcome: StepOutcome }> {
@@ -322,8 +347,15 @@ async function checkSpec(ctx: StepContext, spec: Spec, i: ReturnType<typeof inpu
     spans: i.intent.spans.map((s) => s.id), changeClass: i.intent.changeClass, decisions, excluded, estimate: ctx.state.info.mode === "estimate",
     anchorOk: (id) => (spec.requirements.find((q) => q.id === id)?.anchors ?? []).every((a) => checkEvidence(snap, a).ok),
   });
+  // a new product given the factory's sign-up and log-in must have them (src/stages/accounts.ts)
+  if (i.answers.some((a) => a.id === ACCOUNTS_ID)) {
+    const fails = accountsProblems(spec);
+    lint.push({ check: "L-accounts", passed: !fails.length, blocking: true, fails, details: fails.length ? fails.join("; ") : "ok" });
+  }
+  // the critic runs only when a model was picked for it at the start (or the project file routes it)
+  const criticOff = stepOff(ctx.project, "critic");
   const [critic, restate] = await Promise.all([
-    think(ctx, {
+    criticOff ? { ok: true as const, output: { findings: [] }, note: CRITIC_OFF } : think(ctx, {
       stage: "critic", route: "critic", cls: "read-large", budgetTokens: 30000, tools: [], schema: CriticOut, effort: criticEffort,
       sections: [
         S.template("tpl", criticTemplate(hasRepo(ctx), webSide(ctx))),
@@ -448,7 +480,7 @@ export const specifyStep: StepDef = {
     const fresh = newWork(ctx);
     let before: string[] | undefined;
     for (;;) {
-      const d = downgradeUi(fresh ? allAdded(spec) : spec, testsScreens(ctx.project.stack));
+      const d = downgradeUi(fresh ? allAdded(spec) : spec, screensTested(ctx));
       spec = here(d.spec);
       for (const id of d.downgraded) manualUi.add(id);
       const c = await checkSpec(ctx, spec, i, lane.criticEffort);
@@ -505,7 +537,7 @@ Answer with the changes only, not the whole spec: "requirements" holds each requ
             if (!r.ok) return r;
             const stab = Object.fromEntries(before.requirements.map((q) => [q.id, q.stability]));
             const draft = newWork(ctx) ? allAdded(applyRepair(before, r.output)) : applyRepair(before, r.output);
-            const d = downgradeUi({ ...draft, requirements: draft.requirements.map((q) => ({ ...q, stability: stable(stab, q.id) })) }, testsScreens(ctx.project.stack));
+            const d = downgradeUi({ ...draft, requirements: draft.requirements.map((q) => ({ ...q, stability: stable(stab, q.id) })) }, screensTested(ctx));
             for (const id of d.downgraded) manualUi.add(id);
             return { ok: true, spec: here(d.spec) };
           },

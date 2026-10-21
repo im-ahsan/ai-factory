@@ -2,7 +2,7 @@
 // the document a built API produces says the same. Pure code: no model, no network.
 import { DataModel } from "../contracts/index.js";
 import { DATA_MODEL_FILE, dataModelDiff } from "./data-model.js";
-import { parse } from "yaml";
+import { parse, parseDocument } from "yaml";
 import { defineGate, failure, verdict } from "./engine.js";
 
 type Obj = Record<string, any>;
@@ -13,8 +13,21 @@ const JSON_TYPE = "application/json";
 export function readContract(text: string): Obj | undefined {
   try {
     const d = parse(text) as Obj;
-    return d && typeof d === "object" && typeof d.openapi === "string" && d.paths && typeof d.paths === "object" ? d : undefined;
+    if (!(d && typeof d === "object" && typeof d.openapi === "string" && d.paths && typeof d.paths === "object")) return undefined;
+    for (const [name, s] of Object.entries((d.components?.schemas ?? {}) as Obj)) selfRefs(s, `#/components/schemas/${name}/`);
+    return d;
   } catch { return undefined; }
+}
+
+/**
+ * .NET's generator writes a second use of one type inside a schema as "#/components/schemas/#/properties/a/items", meaning
+ * "#/properties/a/items" of that schema (run 768d: list fields read as missing on 4 attempts). Written out in full, it resolves.
+ */
+function selfRefs(o: unknown, at: string): void {
+  if (!o || typeof o !== "object") return;
+  const x = o as Obj;
+  if (typeof x.$ref === "string" && x.$ref.startsWith("#/components/schemas/#/")) x.$ref = at + x.$ref.slice("#/components/schemas/#/".length);
+  for (const v of Object.values(x)) selfRefs(v, at);
 }
 
 /**
@@ -68,18 +81,96 @@ export function contractProblems(doc: Obj): string[] {
     const rs = Object.entries((def.responses ?? {}) as Obj);
     if (!rs.length) bad.push(`${op} has no response.`);
     for (const [code, r] of rs) {
-      const c = (r as Obj)?.content?.[JSON_TYPE] as Obj | undefined;
+      const c = deref(doc, r as Obj)?.content?.[JSON_TYPE] as Obj | undefined;
       if (c && c.example === undefined && !c.examples) bad.push(`${op} ${code} has no example (the frontend's tests run against it).`);
+      // the generated test handlers answer with the example, typed by the schema: one that leaves out a required field does not
+      // compile, and was found only when the test writers had been paid for (run b587)
+      const examples = c ? (c.example !== undefined ? [c.example] : Object.values((c.examples ?? {}) as Obj).map((x) => (x as Obj)?.value)) : [];
+      const wrong = examples.flatMap((x) => (x === undefined ? [] : exampleProblems(doc, c!.schema, x, "example")));
+      if (wrong.length) bad.push(`${op} ${code}'s example does not match its schema: ${[...new Set(wrong)].slice(0, 5).join("; ")}. Give every example every field its schema requires, with the schema's types.`);
     }
   }
   return bad;
 }
 
+/** A security requirement list that asks for something: [] or [{}] asks for none. */
+const asksLogin = (sec: unknown): boolean => Array.isArray(sec) && sec.some((r) => r && typeof r === "object" && Object.keys(r).length > 0);
+const SIGN_IN_OP = /log-?in|sign-?in|token|sessions?\b|authenticate/i;
+const SIGN_UP_OP = /sign-?up|register|registration/i;
+
+/**
+ * A new product's contract that needs a login must also say how to get one: an open (no login) POST to sign up and one to log
+ * in. A greenfield run built JWT checks on every operation and no way to get a token, so every call failed.
+ */
+export function contractAuthProblems(doc: Obj): string[] {
+  const base = basePath(doc);
+  const ops = Object.entries((doc.paths ?? {}) as Obj).flatMap(([path, item]) => METHODS.filter((m) => (item as Obj)?.[m]).map((m) => ({ m, path, def: (item as Obj)[m] as Obj })));
+  const needs = (def: Obj) => (def.security !== undefined ? asksLogin(def.security) : asksLogin(doc.security));
+  if (!ops.some((o) => needs(o.def))) return [];
+  const open = ops.filter((o) => o.m === "post" && !needs(o.def));
+  const named = (re: RegExp) => open.some((o) => re.test(o.path) || re.test(String(o.def.operationId ?? "")));
+  const missing = [...(named(SIGN_UP_OP) ? [] : [`POST ${base}/auth/register (operationId register)`]), ...(named(SIGN_IN_OP) ? [] : [`POST ${base}/auth/login (operationId login, answering with the token)`])];
+  return missing.length
+    ? [`The contract asks for a login on its operations, but has no open operation to ${missing.length === 2 ? "sign up or log in" : missing[0]!.includes("register") ? "sign up" : "log in"}: add ${missing.join(" and ")}, each with "security: []", or every call that needs a login fails.`]
+    : [];
+}
+
+/** Where an example differs from its schema: a required field it leaves out, or a value of another type. */
+export function exampleProblems(doc: Obj, schema: Obj | undefined, value: unknown, at: string, depth = 0): string[] {
+  const s = whole(doc, schema);
+  if (!s || depth > 12) return [];
+  if (value === null) return s.nullable === true || s.type === "null" || (Array.isArray(s.type) && s.type.includes("null")) ? [] : [`${at} is null and the schema does not allow it`];
+  const type = Array.isArray(s.type) ? s.type.find((t: string) => t !== "null") : s.type ?? (s.properties ? "object" : undefined);
+  const kind = Array.isArray(value) ? "array" : typeof value === "number" ? (Number.isInteger(value) ? "integer" : "number") : typeof value;
+  if (type && !(type === kind || (type === "number" && kind === "integer"))) return [`${at} is ${kind === "object" ? "an object" : `${kind === "array" ? "a list" : `a ${kind}`}`}, the schema says ${type}`];
+  if (kind === "array") return (value as unknown[]).slice(0, 3).flatMap((v, i) => exampleProblems(doc, s.items, v, `${at}[${i}]`, depth + 1));
+  if (kind !== "object") return [];
+  const o = value as Obj;
+  const missing = ((s.required ?? []) as string[]).filter((k) => !(k in o)).map((k) => `${at} has no ${k}, which the schema requires`);
+  return [...missing, ...Object.entries((s.properties ?? {}) as Obj).filter(([k]) => k in o).flatMap(([k, p]) => exampleProblems(doc, p as Obj, o[k], `${at}.${k}`, depth + 1))];
+}
+
+/** What a "$ref" points at, followed to its end: a schema, or a whole answer, request body or parameter kept under components. */
+function deref(doc: Obj, o: Obj | undefined): Obj | undefined {
+  for (let i = 0; o && typeof o.$ref === "string" && i < 12; i++) o = o.$ref.split("/").slice(1).reduce((x: Obj | undefined, k: string) => x?.[k], doc);
+  return o;
+}
+
+/**
+ * A schema with its wrappers taken off, so both ways of writing one thing read the same: "allOf" around a pointer (how a
+ * contract adds a description to a shared type) is that type, several "allOf" parts are one object, and "oneOf"/"anyOf" with
+ * one real member (the other says only "or null") is that member.
+ */
+function whole(doc: Obj, schema: Obj | undefined, depth = 0): Obj | undefined {
+  const s = deref(doc, schema);
+  if (!s || depth > 12) return s;
+  if (Array.isArray(s.allOf) && s.allOf.length) {
+    const parts = s.allOf.map((p: Obj) => whole(doc, p, depth + 1) ?? {});
+    const { allOf: _, ...own } = s;
+    return { ...Object.assign({}, ...parts), ...own, properties: Object.assign({}, ...parts.map((p: Obj) => p.properties), own.properties), required: [...parts.flatMap((p: Obj) => p.required ?? []), ...(own.required ?? [])] };
+  }
+  const real = (s.oneOf ?? s.anyOf)?.filter((m: Obj) => m?.type !== "null" && !(m && Object.keys(m).every((k) => k === "nullable")));
+  if (s.type === undefined && !s.properties && real?.length === 1) return whole(doc, real[0], depth + 1);
+  return s;
+}
+
+/** The one type every value of an enum has, when it has one: "string", "integer", "number" or "boolean". */
+function enumType(values: unknown): string | undefined {
+  if (!Array.isArray(values)) return undefined;
+  const real = values.filter((v) => v !== null);
+  const kinds = new Set(real.map((v) => (typeof v === "number" ? (Number.isInteger(v) ? "integer" : "number") : typeof v)));
+  if (kinds.size === 2 && kinds.has("integer") && kinds.has("number")) return "number";
+  const [only] = kinds;
+  return real.length && kinds.size === 1 && (only === "string" || only === "integer" || only === "number" || only === "boolean") ? only : undefined;
+}
+
 /** A schema as flat facts ("body.items[].id" -> "integer"), following $ref; what a generator adds (format, description) is left out. */
 function facts(doc: Obj, schema: Obj | undefined, at: string, out: Map<string, string>, depth = 0, detail = false): void {
+  schema = whole(doc, schema);
   if (!schema || depth > 12) return;
-  if (typeof schema.$ref === "string") return facts(doc, schema.$ref.split("/").slice(1).reduce((o: Obj | undefined, k: string) => o?.[k], doc), at, out, depth + 1, detail);
-  const type = Array.isArray(schema.type) ? [...schema.type].sort().join("|") : schema.type ?? (schema.properties ? "object" : "any");
+  // a list of allowed values with no type (how .NET writes an enum sent as text) has the type its values have (run e8ef:
+  // `role` was { enum: ["employee", "administrator"] } and was read as "any" against the contract's "string")
+  const type = Array.isArray(schema.type) ? [...schema.type].sort().join("|") : schema.type ?? (schema.properties ? "object" : enumType(schema.enum) ?? "any");
   if (type === "array") return facts(doc, schema.items, `${at}[]`, out, depth + 1, detail);
   if (detail && Array.isArray(schema.enum)) out.set(`${at} values`, schema.enum.map(String).sort().join(", "));
   if (detail && at.includes(".")) out.set(`${at} nullable`, schema.nullable === true ? "yes" : "no");
@@ -97,12 +188,13 @@ function contractFacts(doc: Obj, detail = false): Map<string, string> {
     out.set(op, "exists");
     if (detail) {
       out.set(`${op} operationId`, String(def.operationId ?? "none"));
-      for (const p of (def.parameters ?? []) as Obj[]) out.set(`${op} parameter ${p.name} (${p.in})`, `${p.schema?.type ?? "any"}, ${p.required ? "required" : "optional"}`);
+      for (const p of ((def.parameters ?? []) as Obj[]).map((x) => deref(doc, x) ?? {})) out.set(`${op} parameter ${p.name} (${p.in})`, `${whole(doc, p.schema)?.type ?? "any"}, ${p.required ? "required" : "optional"}`);
     }
-    facts(doc, def.requestBody?.content?.[JSON_TYPE]?.schema, `${op} request`, out, 0, detail);
+    // an answer or a request body may be a pointer to a shared one under components (run e8ef: 53 shared error answers were read as having no body)
+    facts(doc, deref(doc, def.requestBody)?.content?.[JSON_TYPE]?.schema, `${op} request`, out, 0, detail);
     for (const [code, r] of Object.entries((def.responses ?? {}) as Obj)) {
       out.set(`${op} ${code}`, "exists");
-      facts(doc, (r as Obj)?.content?.[JSON_TYPE]?.schema, `${op} ${code} body`, out, 0, detail);
+      facts(doc, deref(doc, r as Obj)?.content?.[JSON_TYPE]?.schema, `${op} ${code} body`, out, 0, detail);
     }
   }
   return out;
@@ -127,6 +219,66 @@ export function contractDiff(contract: Obj, built: Obj, detail = false): string[
   return out;
 }
 
+/**
+ * A locked contract with a plan's new operations added: `additions` is YAML (or JSON) with `paths` (the new operations) and,
+ * when they need them, new `components` (schemas, responses, parameters, request bodies). Only what is not there yet goes in:
+ * an operation, or a component of the same name with other content, already in the contract is a problem, not a replacement.
+ * The rest of the file keeps its own layout and comments, so the change reads as an addition in the pull request.
+ */
+export function addToContract(contractText: string, additions: string): { text: string; problems: string[] } {
+  let add: Obj;
+  try { add = parse(additions) as Obj; } catch (e) { return { text: contractText, problems: [`contractAdditions is not YAML: ${(e as Error).message.split("\n")[0]}`] }; }
+  if (!add || typeof add !== "object" || !add.paths || typeof add.paths !== "object") return { text: contractText, problems: ['contractAdditions needs "paths": the new operations, under their paths'] };
+  const json = contractText.trimStart().startsWith("{");
+  const doc = json ? undefined : parseDocument(contractText);
+  const old = (json ? JSON.parse(contractText) : doc!.toJS()) as Obj;
+  const problems: string[] = [];
+  const put = (keys: string[], value: unknown) => {
+    if (doc) doc.setIn(keys, doc.createNode(value));
+    else { let o = old; for (const k of keys.slice(0, -1)) o = (o[k] ??= {}); o[keys.at(-1)!] = value; }
+  };
+  for (const [path, item] of Object.entries(add.paths as Obj)) {
+    const had = (old.paths as Obj | undefined)?.[path] as Obj | undefined;
+    for (const m of METHODS.filter((m) => (item as Obj)?.[m])) {
+      if (had?.[m]) problems.push(`${m.toUpperCase()} ${path} is already in the contract: give only new operations; one already there stays as it is`);
+      else put(["paths", path, m], (item as Obj)[m]);
+    }
+  }
+  for (const [kind, named] of Object.entries((add.components ?? {}) as Obj)) {
+    for (const [name, value] of Object.entries((named ?? {}) as Obj)) {
+      const had = (old.components as Obj | undefined)?.[kind]?.[name];
+      if (had === undefined) put(["components", kind, name], value);
+      else if (JSON.stringify(had) !== JSON.stringify(value)) problems.push(`components.${kind}.${name} is already in the contract with other content: give the new one another name`);
+    }
+  }
+  return { text: doc ? doc.toString({ lineWidth: 0 }) : JSON.stringify(old, null, 2) + "\n", problems };
+}
+
+/**
+ * What a brownfield plan's new version of a locked contract does to it: the operations it adds, and everything else it
+ * changes (an operation removed, a field, status code, parameter or operation id changed or added to an operation that was
+ * already there). The web app is built against the old version, so only `added` may pass without the spec asking for it
+ * (run 3406: an auth flow needed four operations the locked contract lacked, and the plan could not give them).
+ */
+export function contractChange(before: Obj, after: Obj): { added: string[]; changed: string[] } {
+  const was = contractFacts(before, true), now = contractFacts(after, true);
+  const oldOps = new Set(operations(before).map((o) => o.op));
+  const added = operations(after).map((o) => o.op).filter((op) => !oldOps.has(op));
+  const under = (k: string, ops: string[]) => ops.some((g) => k === g || k.startsWith(`${g} `) || k.startsWith(`${g}.`) || k.startsWith(`${g}[`));
+  const changed: string[] = [], removed: string[] = [];
+  for (const [k, v] of was) {
+    if (!now.has(k)) { if (!under(k, removed)) { removed.push(k); changed.push(`removed: ${k}`); } }
+    else if (now.get(k) !== v) changed.push(`${k}: was ${v}, now ${now.get(k)}`);
+  }
+  const grown: string[] = [];
+  for (const k of now.keys()) if (!was.has(k) && !under(k, added) && !under(k, grown)) { grown.push(k); changed.push(`added to an operation already in the contract: ${k}`); }
+  return { added, changed };
+}
+
+/** An operation that declares no request body and no answer with a body: what an interface stub looks like in the built document. */
+const isStub = (doc: Obj, def: Obj): boolean =>
+  !deref(doc, def.requestBody)?.content && Object.values((def.responses ?? {}) as Obj).every((r) => !deref(doc, r as Obj)?.content);
+
 /** The API's own OpenAPI document, written by its build, says what the locked contract says. */
 export const contractMatches = defineGate<{ contract: { text: string }; built: { text?: string; path: string; partial?: boolean } }>({
   id: "contract.matches", after: "implement", safety: false, waiver: "none",
@@ -136,8 +288,19 @@ export const contractMatches = defineGate<{ contract: { text: string }; built: {
     const have = built.text === undefined ? undefined : readContract(built.text);
     if (!have) return verdict([failure("contract", `The build did not write the API's OpenAPI document at ${built.path}. Keep the project's build-time OpenAPI settings and the AddOpenApi() call.`)], "");
     // one task of several: an operation no task has built yet is not a mismatch; what is built must match, and nothing extra
-    const diff = contractDiff(want, have).filter((d) => !built.partial || !/^missing in the API: [A-Z]+ \S+$/.test(d));
-    return verdict(diff.slice(0, 20).map((d) => failure("contract", `The API does not match the locked contract: ${d}`)), "The API matches the locked contract");
+    const all = contractDiff(want, have);
+    // a stub is not built yet either: the interface stubs put every operation in the API from the start, with no body or request
+    // declared (run 9071: each task lost its first attempt to a later task's stubbed operations, "missing … 200 body / 401")
+    const planned = new Set(operations(want).map(({ op }) => op));
+    const stubs = built.partial ? operations(have).filter(({ op, def }) => planned.has(op) && isStub(have, def)).map(({ op }) => op) : [];
+    const ofStub = (d: string) => { const k = d.replace(/^(missing in the API|not in the contract): /, ""); return stubs.some((s) => k === s || k.startsWith(`${s} `)); };
+    const diff = all.filter((d) => !built.partial || (!/^missing in the API: [A-Z]+ \S+$/.test(d) && !ofStub(d)));
+    const inContract = operations(want).length, inApi = operations(have).length;
+    return {
+      ...verdict(diff.slice(0, 20).map((d) => failure("contract", `The API does not match the locked contract: ${d}`)), "The API matches the locked contract"),
+      // what was compared, so a pass can be told from a check that had little to look at
+      facts: { operationsInContract: inContract, operationsInApi: inApi, notBuiltYetLeftOut: all.length - diff.length, differences: diff.length, differencesShown: Math.min(diff.length, 20), partial: !!built.partial },
+    };
   },
 });
 

@@ -77,6 +77,22 @@ describe("a full-stack product: two repos, one contract", () => {
     expect(apiRequest("Staff sign in.")).toMatch(/^Staff sign in\.\n\nThis run builds the API side[\s\S]*contracts\/openapi\.yaml[\s\S]*PostgreSQL database \(the connection string named App/);
   });
 
+  it("a product from a meeting: the web run distills the transcript, and the API run reads the approved brief", async () => {
+    const p = setUpProduct("clinic", dir);
+    const transcript = { format: "gemini-meet" as const, notes: "", speakers: ["Alex Morgan"], turns: [{ id: "T-1", time: "00:00:41", speaker: "Alex Morgan", text: "Staff sign in and record each delivery" }] };
+    p.request = "T-1 [00:00:41] Alex Morgan: Staff sign in and record each delivery";
+    p.web.run = await createRun(p.request, p.web.project, "tester", { transcript });
+    saveProduct(p);
+    const l = Ledger.open(p.web.run);
+    expect(replay(l.events()).info.transcriptSha).toBeDefined();
+    await l.append({ type: "step.completed", key: "distill/1", inputsHash: "a".repeat(64), outputs: [l.putJson({})], data: { brief: "# Clinic deliveries\n\n## Requirements\n- R-1: Staff record each delivery" } }, HUMAN_WRITER);
+    await done(l, "plan", [l.putJson({ stubs: [{ path: CONTRACT_FILE, content: "openapi: 3.0.3\npaths: {}\n", reason: "" }] })]);
+    await done(l, "approve", [l.putJson({ approved: true })]);
+    const api = replay(Ledger.open((await startApiRun(loadProduct("clinic"), "tester"))!).events());
+    expect(api.info.request).toMatch(/^# Clinic deliveries[\s\S]*R-1: Staff record each delivery[\s\S]*This run builds the API side/);
+    expect(api.info.request).not.toContain("T-1 [00:00:41]");
+  });
+
   it("sets every new product's API up on PostgreSQL, and says so when the request names another database", () => {
     const p = setUpProduct("clinic", dir, "Staff sign in. Keep it in SQLite.");
     const read = (f: string) => readFileSync(join(p.api.repo, f), "utf8");
@@ -98,5 +114,25 @@ describe("a full-stack product: two repos, one contract", () => {
     const p = setUpProduct("clinic", dir);
     expect(() => writeRunFiles(p)).toThrow(/Both runs must be delivered/);
     expect(existsSync(join(dir, "clinic-run"))).toBe(false);
+  });
+
+  it("starts each run's branch as it is now: a fix committed on the PR after delivery is in the next start", async () => {
+    const p = setUpProduct("clinic", dir);
+    for (const side of [p.web, p.api]) {
+      side.run = await createRun("A portal where clinic staff sign in", side.project, "tester");
+      await done(Ledger.open(side.run), "deliver", [Ledger.open(side.run).putJson({})]);
+      git(side.repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "delivered");
+      git(side.repo, "branch", `factory/${side.run}`);
+    }
+    saveProduct(p);
+    const out = writeRunFiles(p);
+    const head = (s: string) => git(join(out, s), "log", "-1", "--format=%s").trim();
+    expect(head("web")).toBe("delivered");
+    // the PR's fix: a later commit on the run's branch
+    const fix = git(p.web.repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", "-m", "fix", "-p", `factory/${p.web.run}`, `factory/${p.web.run}^{tree}`).trim();
+    git(p.web.repo, "update-ref", `refs/heads/factory/${p.web.run}`, fix);
+    writeRunFiles(p);
+    expect(head("web")).toBe("fix");
+    expect(head("api")).toBe("delivered");
   });
 });

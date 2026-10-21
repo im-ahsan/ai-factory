@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _resetEnvCache } from "../config/env.js";
 import { ProjectConfig } from "../config/project.js";
-import { availableRungs, checkRoutes, DEFAULT_ROUTES, ESTIMATE_ROUTES, lightLaneModel, mechanical, modelFor, modelSteps, modelsView, projectForRun, resolveRoute, resolveRun, routeFor, routeRecord, routeSource, routeWarnings, usageRoute, usesDesignEngine } from "./routing.js";
+import { availableRungs, checkRoutes, DEFAULT_ROUTES, DESIGN_ROUTES, ESTIMATE_ROUTES, lightLaneModel, mechanical, modelFor, modelSteps, modelsView, projectForRun, resolveRoute, resolveRun, routeFor, routeRecord, routeSource, routeWarnings, stepOff, usageRoute, usesDesignEngine } from "./routing.js";
 
 const KEYS = ["FACTORY_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] as const;
 function cleanEnv(set: Partial<Record<(typeof KEYS)[number], string>> = {}): void {
@@ -56,7 +56,7 @@ describe("which model a step runs on", () => {
     expect(resolveRoute(project, "implement")).toMatchObject({ runner: "claude-agent", model: "claude-sonnet-5-5", effort: "high", tier: "standard", escalate: ["claude-opus-5-5"] });
     expect(resolveRoute(project, "specify-other")).toMatchObject({ model: "gpt-6-sol", effort: "high", escalate: [] });
     expect(resolveRoute(project, "author-tests")).toMatchObject({ model: "claude-opus-5-5", escalate: [] });
-    expect(Object.keys(DEFAULT_ROUTES)).toHaveLength(22);
+    expect(Object.keys(DEFAULT_ROUTES)).toHaveLength(23); // + distill (transcript runs)
   });
 
   it("a pick wins over a preset, a preset over the project file, the file over the default", () => {
@@ -78,9 +78,18 @@ describe("which model a step runs on", () => {
     for (const stage of Object.keys(DEFAULT_ROUTES)) expect(resolveRoute(project, stage, { preset: "balanced" })).toMatchObject(DEFAULT_ROUTES[stage]!);
   });
 
-  it("the critic takes a pick or a project file entry like any step, and a preset keeps it on the heavy tier", () => {
-    expect(resolveRoute(project, "critic")).toMatchObject({ model: "claude-opus-5-5", effort: "high", source: "default", escalate: [] });
-    for (const preset of ["economy", "balanced", "quality"] as const) expect(resolveRoute(project, "critic", { preset })).toMatchObject({ model: "claude-opus-5-5", effort: "high", tier: "heavy" });
+  it("the critic is off until a pick or a project file entry names its model; a preset does not turn it on, and keeps one the file turned on to the heavy tier", () => {
+    expect(resolveRoute(project, "critic")).toMatchObject({ model: "claude-opus-5-5", source: "off" });
+    for (const preset of ["economy", "balanced", "quality"] as const) expect(resolveRoute(project, "critic", { preset }).source).toBe("off");
+    expect(stepOff(project, "critic")).toBe(true);
+    expect(stepOff(projectForRun(project, resolveRun(project, { preset: "quality" })), "critic")).toBe(true);
+    expect(stepOff(projectForRun(project, resolveRun(project, { picks: { critic: "claude-opus-5-5" } })), "critic")).toBe(false);
+    expect(stepOff(withFile, "critic")).toBe(false);
+    // a run from before the picker keeps the critic it began with
+    expect(stepOff(projectForRun(project, undefined), "critic")).toBe(false);
+    expect(resolveRoute(withFile, "critic", { preset: "economy" })).toMatchObject({ model: "claude-opus-5-5", effort: "high", tier: "heavy" });
+    // off, it needs no key and is listed as off with the models that turn it on
+    expect(modelsView(undefined).steps.find((s) => s.step === "critic")).toMatchObject({ off: true, offered: ["gpt-6-luna", "gpt-6-sol", "claude-opus-5-5"] });
     expect(resolveRoute(project, "critic", { preset: "economy", picks: { critic: "gpt-6-sol" } })).toMatchObject({ model: "gpt-6-sol", effort: "high", source: "pick", escalate: ["claude-opus-5-5"] });
     expect(resolveRoute(withFile, "critic")).toMatchObject({ model: "gpt-6-sol", source: "config" });
     expect(routeFor(withFile, "critic").model).toBe("gpt-6-sol");
@@ -116,7 +125,12 @@ describe("which model a step runs on", () => {
     expect(checkRoutes(project, undefined, { picks: { nope: "gpt-6-sol" } })[0]).toMatch(/nope is not a step that takes a model/);
     expect(checkRoutes(project, undefined, { picks: { specify: "gpt-6-sol", implement: "claude-opus-5-5" } })).toEqual([]);
     expect(routeWarnings(project)).toEqual([]);
-    expect(routeWarnings(project, { picks: { specify: "claude-opus-5-5" } })).toEqual(["specify on Claude Opus 5.5: the critic is Claude Opus 5.5 too, so it reads a spec its own model wrote"]);
+    // no warning while the critic is off
+    expect(routeWarnings(project, { picks: { specify: "claude-opus-5-5" } })).toEqual([]);
+    // nor when it is turned on with its default model, beside the spec steps' defaults
+    expect(routeWarnings(project, { picks: { critic: "claude-opus-5-5" } })).toEqual([]);
+    expect(routeWarnings(project, { picks: { specify: "gpt-6-sol", merge: "gpt-6-sol", critic: "claude-opus-5-5" } })).toEqual([]);
+    expect(routeWarnings(project, { picks: { specify: "gpt-6-sol", critic: "gpt-6-sol" } })).toEqual(["specify on GPT-6 Sol: the critic is GPT-6 Sol too, so it reads a spec its own model wrote", "specify-other on GPT-6 Sol: the critic is GPT-6 Sol too, so it reads a spec its own model wrote"]);
     const claudeDraft = ProjectConfig.parse({ project: "p", repo: "-", stack: "dotnet", steps: { "specify-other": { model: "claude-opus-5-5" } } });
     expect(checkRoutes(claudeDraft).join("\n")).toMatch(/specify-other is the second spec draft, written by another vendor than the first; .* \(set in the project file\)/);
     // the warning follows the critic's own model: moved to GPT-6 Sol it is the second draft that shares it
@@ -140,7 +154,7 @@ describe("which model a step runs on", () => {
     // the project file changed after the run began: the run does not move
     expect(routeFor(run, "design").model).toBe("claude-opus-5-5");
     expect(routeRecord(run, "plan", 2)).toMatchObject({ model: "claude-opus-5-5", source: "pick", movedUpFrom: "gpt-6-sol" });
-    expect(usageRoute(run, "critic")).toEqual({ "factory.route": "critic", "factory.route.source": "default", "factory.route.tier": "heavy" });
+    expect(usageRoute(run, "critic")).toEqual({ "factory.route": "critic", "factory.route.source": "off" });
     expect(routeFor(old, "intake").model).toBe("claude-haiku-4-5");
     expect(routeFor(old, "critic").model).toBe("gpt-5.5");
     expect(routeSource(old, "critic").source).toBe("before the picker");
@@ -350,5 +364,33 @@ describe("design tier routes", () => {
   it("leaves other steps' escalation as it was", () => {
     expect(modelFor(cfg(), "implement", 2).model).toBe("claude-opus-5-5");
     expect(modelSteps(cfg(), "implement")).toBe(1);
+  });
+});
+
+describe("distill in the model picker", () => {
+  const project = ProjectConfig.parse({ project: "demo", repo: "/x", stack: "dotnet" });
+  it("has a route on the heavy tier, effort medium", () => {
+    expect(resolveRun(project, {}).distill).toMatchObject({ runner: "api", effort: "medium", tier: "heavy" });
+  });
+  it("gets a dropdown in every kind of run, first in the list, with models to pick and a model per preset", () => {
+    for (const mode of [undefined, "greenfield", "estimate", "design"]) {
+      const v = modelsView(mode);
+      const d = v.steps.find((s) => s.step === "distill");
+      expect(d, `mode ${mode}`).toBeDefined();
+      expect(v.steps[0]!.step).toBe("distill");
+      // the same models as the other thinking steps
+      expect(d!.offered).toEqual(v.steps.find((s) => s.step === "intake")!.offered);
+      expect(d!.offered).toContain("claude-opus-5-5");
+      expect(Object.keys(d!.presets).length).toBe(v.presets.length);
+    }
+    expect(DESIGN_ROUTES).toContain("distill");
+  });
+  it("a person's pick goes into the run's routes and is recorded as a pick", () => {
+    expect(resolveRun(project, { picks: { distill: "gpt-6-sol" } }).distill).toMatchObject({ model: "gpt-6-sol", source: "pick" });
+    // offered, so not refused (the check may still list missing API keys on this machine)
+    expect(checkRoutes(project, ESTIMATE_ROUTES, { picks: { distill: "gpt-6-sol" } }).join("\n")).not.toMatch(/not offered/);
+  });
+  it("a model the step does not offer is refused before the run starts", () => {
+    expect(checkRoutes(project, ESTIMATE_ROUTES, { picks: { distill: "not-a-model" } }).join("\n")).toMatch(/distill/);
   });
 });

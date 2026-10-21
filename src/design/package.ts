@@ -17,8 +17,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { DesignTheme } from "../contracts/artifacts.js";
-import { COMPONENTS_ID, demoStates, stateKind } from "./demo.js";
-import { captureDemo, type Shot, type ShotResult, type ScreenShotInput, type Viewport } from "./screenshots.js";
+import { COMPONENTS_ID, demoStates, frameStateOf } from "./demo.js";
+import { captureDemo, fileSlug, type Shot, type ShotResult, type ScreenShotInput, type Viewport } from "./screenshots.js";
 import { designTokens } from "./tokens.js";
 import { factoryHome } from "../util/paths.js";
 import { STANDALONE_PROJECT } from "../config/project.js";
@@ -283,7 +283,6 @@ export interface PackageInput {
 /** `kind` is the state as the demo reads it (normal, empty, error, ...; src/design/demo.ts stateKind). */
 export interface OwnPicture { id: string; kind: string; viewport: Viewport; png: Uint8Array }
 
-const fileSlug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "state";
 
 /** The design's own pictures as the package's shots: one per screen state that has one, named as the demo's are. */
 function ownShots(p: PackageInput, outDir: string): ShotResult & { states: Map<string, string[]> } {
@@ -293,7 +292,7 @@ function ownShots(p: PackageInput, outDir: string): ShotResult & { states: Map<s
   for (const s of p.design.screens) {
     const drawn: string[] = [];
     demoStates(s as never).forEach((st, k) => {
-      const pic = p.pictures!.find((x) => x.id === s.id && x.kind === (k === 0 ? "normal" : stateKind(st)));
+      const pic = p.pictures!.find((x) => x.id === s.id && x.kind === frameStateOf(s as never, st, k));
       if (!pic) { missing.push(`${s.id} ${st}`); return; }
       const file = `${fileSlug(s.id)}-${fileSlug(st)}-${pic.viewport}.png`;
       if (shots.some((x) => x.file === file)) return;

@@ -40,6 +40,58 @@ public class OrderSync
 `;
 
 describe("secrets", () => {
+  it("does not take a sign-in form's own code for a secret, and still reports a literal (run 1679)", () => {
+    for (const line of [
+      "const response = await signIn({ email: normalizedEmail, password: passphrase });",
+      "writeSession({ accessToken: response.data.accessToken, ...response.data.user });",
+      "  accessToken: string;",
+      "<PasswordField password={password} onChange={setPassword} />",
+      "const schema = z.object({ password: z.string().min(8) });",
+      "var request = new SignIn { Password = model.Password };",
+      // a parameter before a return type (run e220)
+      "export async function login(email: string, password: string): Promise<AuthResult> {",
+    ]) expect(scanText(line.includes("var ") ? "a.cs" : "a.tsx", line), line).toEqual([]);
+    // the lines of run 1679's sign-in screen and session file that the scan reported or could have, as the three attempts wrote them
+    for (const line of [
+      '  accessToken: "demo-token-01",',
+      'const fixtureError = "Invalid email or password.";',
+      '    const password = String(formData.get("password") ?? "");',
+      '    const nextFieldErrors: { email?: string; password?: string } = {};',
+      '    if (!password) nextFieldErrors.password = "Password is required.";',
+      "      const response = await signIn({ email, password });",
+      "        password: response.data.fieldErrors?.password,",
+      '                  type="password"',
+      '    const credential = fields.get("password");',
+      "      writeSession({ ...response.data.user, accessToken: response.data.accessToken });",
+      '                <Input id="password" name="password" type="password" autoComplete="current-password" required />',
+      "export type SessionState = SessionUser & { accessToken: string };",
+      '    setPassphraseError(missingPassphrase ? "Enter your password." : "");',
+      '      setPassphraseError(fieldErrors?.password ?? "");',
+      "  accessToken?: string;",
+    ]) expect(scanText(line.includes("SessionState") || line.includes("accessToken?") ? "lib/auth/session.ts" : "components/screens/s-1/container.tsx", line), line).toEqual([]);
+    // a literal that is neither sample data nor a message is still a secret, in a screen too
+    expect(scanText("components/screens/s-1/container.tsx", '  accessToken: "9f8a7c6b5d4e3f2a",').map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.tsx", "errors.password = 'hunter2222 ';").map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.yaml", 'password: "demo-token-01"').map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.ts", 'const password = "hunter2222";').map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.ts", "const conn = `Host=db.example.com;Password=hunter2222`;").map((h) => h.rule)).toEqual(["password-assignment"]);
+    // outside source files nothing changes: a bare value in a config file is a secret
+    expect(scanText(".env", "PASSWORD=hunter2222").map((h) => h.rule)).toEqual(["password-assignment"]);
+    expect(scanText("a.yaml", "password: hunter2222").map((h) => h.rule)).toEqual(["password-assignment"]);
+  });
+  it("does not report a test file's made-up passwords, and still reports a key with a known shape there (run 9071)", () => {
+    for (const [file, line] of [
+      ["App.Tests/AcceptancePart4Tests.cs", '  var r = new { email = "a@example.test", password = "Parking2025!" };'],
+      ["App.Tests/AcceptancePart4Tests.cs", '  throw new NpgsqlException("SQL SELECT x; password=Part4Secret; connection refused");'],
+      ["tests/acceptance.part1.test.tsx", '  await user.type(field, "Hunter2222!"); const password = "Hunter2222!";'],
+      // a contract's example request and answer (run 4049)
+      ["contracts/openapi.yaml", '              password: "Parking2025!"'],
+      ["contracts/openapi.yaml", '              accessToken: "eyJhbGciOi-example-token"'],
+    ]) expect(scanText(file!, line!), line).toEqual([]);
+    expect(scanText("App.Tests/AcceptancePart4Tests.cs", 'var k = "AKIAABCDEFGHIJKLMNOP";').map((h) => h.rule)).toEqual(["aws-access-key"]);
+    // the same line outside a test file is still a secret
+    expect(scanText("App.Api/Program.cs", 'var r = new { password = "Parking2025!" };').map((h) => h.rule)).toEqual(["password-assignment"]);
+  });
   it("does not report the password of a database on this machine, and still reports any other (run e1b5)", () => {
     expect(scanText("a.cs", "const string c = \"Host=127.0.0.1;Port=1;Database=x;Username=nobody;Password=nobody;Timeout=3\";")).toEqual([]);
     expect(scanText("a.json", "\"App\": \"Server=localhost;Database=x;Password=postgres1\"")).toEqual([]);
@@ -85,6 +137,14 @@ describe("snapshot and tools", () => {
     expect(checkEvidence(snap, { path: "src/OrderSync.cs", lineStart: 4, lineEnd: 4, quote: "public async Task<int> SyncAsync(int customerId, CancellationToken ct)" }).ok).toBe(true);
     expect(checkEvidence(snap, { path: "src/OrderSync.cs", lineStart: 4, lineEnd: 4, quote: "public void Invented()" }).ok).toBe(false);
     expect(checkEvidence(snap, { path: "src/Nope.cs", lineStart: 1, lineEnd: 1, quote: "x" }).ok).toBe(false);
+    // a long line cut short with "…" (run 5d51): the parts around it must be there, in order
+    expect(checkEvidence(snap, { path: "src/OrderSync.cs", lineStart: 4, lineEnd: 4, quote: "public async Task<int> SyncAsync(int customerId, …" }).ok).toBe(true);
+    expect(checkEvidence(snap, { path: "src/OrderSync.cs", lineStart: 4, lineEnd: 4, quote: "public async … CancellationToken ct)" }).ok).toBe(true);
+    expect(checkEvidence(snap, { path: "src/OrderSync.cs", lineStart: 4, lineEnd: 4, quote: "CancellationToken ct) … public async" }).ok).toBe(false);
+    expect(checkEvidence(snap, { path: "src/OrderSync.cs", lineStart: 4, lineEnd: 4, quote: "public void Invented(…" }).ok).toBe(false);
+    expect(checkEvidence(snap, { path: "src/OrderSync.cs", lineStart: 4, lineEnd: 4, quote: "…" }).ok).toBe(false);
+    // a secret the model saw masked (run afd1): the parts around the placeholder
+    expect(checkEvidence(snap, { path: "src/OrderSync.cs", lineStart: 4, lineEnd: 4, quote: "public async Task<int> «SECRET_3»(int customerId, CancellationToken ct)" }).ok).toBe(true);
   });
 
   it("extracts C# symbols", () => {

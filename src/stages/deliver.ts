@@ -25,9 +25,10 @@ import { modelFor } from "./routing.js";
 import { S, think } from "./think.js";
 import { changeBase, ensureWorktree, toolsAt } from "./workspace.js";
 import { recordTestLesson } from "../context/lessons.js";
+import { demoMode } from "../util/demo.js";
 import { followUpSection, readImpact } from "./impact.js";
-import { rewrittenTests, type Judged } from "./test-defect.js";
-import { contractLockFiles } from "./contract.js";
+import { disputedTests, openedFiles, rewrittenTests, type Disputed, type Judged } from "./test-defect.js";
+import { contractLockFiles, provedByApi, provenHere } from "./contract.js";
 import { isSettingsFile, newSettings, settingsSection, type SettingsNeeded } from "./outside-systems.js";
 
 /** Only a delivered run teaches the next one where its tests go; never fails delivery. */
@@ -38,7 +39,7 @@ function learnFrom(ctx: StepContext, wt: string, lockedFiles: string[]): void {
 }
 
 type Spec = z.infer<typeof SpecDraft>;
-type Plan = z.infer<typeof PlanBody>;
+type Plan = z.infer<typeof PlanBody> & { contractAdded?: string[] };
 
 const gatedSha = (ctx: Pick<StepContext, "state">) => String(ctx.state.steps.get("integrate")!.data!.commit);
 
@@ -146,7 +147,8 @@ export const reviewStep: StepDef = {
     };
   },
   async run(ctx) {
-    const spec = requireOutput<Spec>(ctx.state, ctx.ledger, "specify");
+    const specified = requireOutput<Spec>(ctx.state, ctx.ledger, "specify");
+    const spec = provenHere(ctx.project, specified);
     const head = gatedSha(ctx);
     // the review already written for this commit, when the step stopped on a card after it: read again, not paid for again
     const kept = keptReview(ctx, head);
@@ -158,13 +160,16 @@ export const reviewStep: StepDef = {
     /** a card raised from here on carries the review, so answering it does not buy a second one */
     const hold = (o: StepOutcome): StepOutcome => (o.kind === "wait"
       ? { ...o, card: { ...o.card, extra: { ...(o.card.extra ?? {}), reviewFor: head, reviewSha, familiesSha: fam, diffTruncated: truncated } } } : o);
-    const specSha = ctx.state.steps.get("specify")!.outputs[0]!;
+    // the criteria the gates hold this repo to (provenHere): the web side's share, stored for the gate record
+    const specSha = spec === specified ? ctx.state.steps.get("specify")!.outputs[0]! : ctx.ledger.putJson(spec);
     // completeness first: a review that skipped a criterion has not reviewed the change, so there
     // is nothing yet to judge. A fail, not a park — the ladder retries, raises effort, or uses a
     // stronger model, rather than asking a person to fix what the model should simply redo.
     const cg = await runGate(reviewCoversCriteria, ctx.ledger, ctx.writer,
       { review: reviewSha, spec: specSha }, ctx.policy, { step: "review", treeSha: head });
-    if (!cg.passed) {
+    // DEMO: a review that left criteria without a verdict goes on; those criteria are logged (and stay unreviewed on the PR)
+    if (!cg.passed && demoMode()) ctx.log(`DEMO review: going on without a verdict for ${(cg.failures ?? []).length} criteria: ${(cg.failures ?? []).slice(0, 8).map((f) => f.message.match(/AC-[\w.]+/)?.[0] ?? f.message).join(", ")}`);
+    else if (!cg.passed) {
       return {
         kind: "fail", category: "other",
         failures: cg.failures ?? [failure("coverage", cg.details)],
@@ -190,11 +195,17 @@ export const reviewStep: StepDef = {
         waivers = w.waivers;
       }
     }
-    if (!g.passed) return { kind: "park", reason: `Review found blocking problems: ${(g.failures ?? []).slice(0, 3).map((f) => f.message).join(" | ")}` };
+    // DEMO: the review's blocking findings are logged and the run goes on to the pull request, where they are listed anyway
+    // and kept for the top of the pull request (run 7850: a security finding went through, listed only among the others)
+    const demoBlocking = !g.passed && demoMode() ? (g.failures ?? []).map((f) => f.message) : [];
+    if (demoBlocking.length) ctx.log(`DEMO review: delivering despite ${demoBlocking.length} blocking finding(s): ${demoBlocking.slice(0, 3).join(" | ")}`);
+    else if (!g.passed) return { kind: "park", reason: `Review found blocking problems: ${(g.failures ?? []).slice(0, 3).map((f) => f.message).join(" | ")}` };
     // a criterion the reviewer found no test for at all stops the run here: nothing proves it, and the tests are locked, so
     // a person accepts that by name or stops
     // (one a person accepted before the tests were locked is not asked about again)
-    const acceptedUntested = (ctx.state.steps.get("author-tests")?.data as { acceptedUntested?: string[] } | undefined)?.acceptedUntested ?? [];
+    // (and, in a lenient run, a criterion whose tests were all left out as wrong: already named on the PR as not proven)
+    const acceptedUntested = [...new Set([...((ctx.state.steps.get("author-tests")?.data as { acceptedUntested?: string[] } | undefined)?.acceptedUntested ?? []),
+      ...((ctx.state.steps.get("accept")?.data as { disputed?: string[] } | undefined)?.disputed ?? [])])];
     const proof = await runGate(criteriaHaveTests, ctx.ledger, ctx.writer, { review: reviewSha, spec: specSha, ...(acceptedUntested.length ? { accepted: ctx.ledger.putJson({ acIds: acceptedUntested }) } : {}) }, ctx.policy, { step: "review", treeSha: head });
     if (!proof.passed) {
       const w = buildWaiver(ctx, "review", [{ def: criteriaHaveTests, failures: proof.failures ?? [failure(criteriaHaveTests.id, proof.details)] }], head,
@@ -220,7 +231,7 @@ export const reviewStep: StepDef = {
       }
       manualChecks = { by: signed.by, criteria: manual.map((c) => c.id) };
     }
-    return { kind: "done", outputs: { review: reviewSha }, data: { findings: review.findings.length, note: review.note, diffTruncated: truncated, ...(waivers.length ? { waivers } : {}), ...(weakTests.length ? { weakTests } : {}), ...(manualChecks ? { manualChecks } : {}) } };
+    return { kind: "done", outputs: { review: reviewSha }, data: { findings: review.findings.length, note: review.note, diffTruncated: truncated, ...(waivers.length ? { waivers } : {}), ...(weakTests.length ? { weakTests } : {}), ...(manualChecks ? { manualChecks } : {}), ...(demoBlocking.length ? { demoBlocking } : {}) } };
   },
 };
 
@@ -272,16 +283,21 @@ async function writeReview(ctx: StepContext, spec: Spec, head: string): Promise<
 // ---------- deliver ----------
 /** How a criterion's locked test proves it, in the PR text. */
 const PROOF: Record<string, string> = { unit: "unit test", api: "HTTP test + probe", job: "job test", ui: "screen test", manual: "manual" };
-export function prBody(ctx: Pick<StepContext, "state" | "runId">, a: { spec: Spec; plan: Plan; lock: { tests: { acId: string; testId: string }[]; familyNote?: string }; run: TestRun; review: { findings: { id: string; severity: string; text: string; category?: string; owasp?: string; file?: string; line?: number }[]; note?: string }; manifestHash: string; commits: string[]; rewritten?: Judged[]; settings?: SettingsNeeded[] }): string {
+export function prBody(ctx: Pick<StepContext, "state" | "runId">, a: { spec: Spec; plan: Plan; lock: { tests: { acId: string; testId: string }[]; familyNote?: string }; run: TestRun; review: { findings: { id: string; severity: string; text: string; category?: string; owasp?: string; file?: string; line?: number }[]; note?: string }; manifestHash: string; commits: string[]; disputed?: Disputed[]; rewritten?: Judged[]; opened?: ReturnType<typeof openedFiles>; settings?: SettingsNeeded[]; byApi?: string[] }): string {
   const flaky = a.run.results.filter((r) => r.flaky).map((r) => r.id);
   const security = a.review.findings.filter((f) => f.category === "security");
   // what a person decided at the review: the criteria tried by hand, and any check accepted as it stands
-  const reviewed = ctx.state.steps.get("review")?.data as { manualChecks?: { by: string; criteria: string[] }; waivers?: { gateIds: string[]; human: string; reason: string }[]; weakTests?: { acId: string; why: string }[] } | undefined;
+  const reviewed = ctx.state.steps.get("review")?.data as { manualChecks?: { by: string; criteria: string[] }; waivers?: { gateIds: string[]; human: string; reason: string }[]; weakTests?: { acId: string; why: string }[]; demoBlocking?: string[] } | undefined;
   const weak = reviewed?.weakTests ?? [];
   // a criterion accepted with no test before the tests were locked
   const written = ctx.state.steps.get("author-tests")?.data as { waivers?: { gateIds: string[]; human: string; reason: string }[]; acceptedUntested?: string[] } | undefined;
   const byHand = new Set(reviewed?.manualChecks?.criteria ?? []);
+  // the change size, design size or estimate size accepted at integrate (by a person, or in demo mode without asking)
+  const integrated = ctx.state.steps.get("integrate")?.data as { waivers?: { gateIds: string[]; human: string; reason: string }[] } | undefined;
+  // DEMO: blocking findings delivered anyway, security first, before anything else on the page
+  const demoBlocking = [...(reviewed?.demoBlocking ?? [])].sort((x, y) => Number(/\[security\//.test(y)) - Number(/\[security\//.test(x)));
   return [
+    ...(demoBlocking.length ? [`> [!WARNING]`, `> **Delivered in demo mode with ${demoBlocking.length} blocking review finding${demoBlocking.length === 1 ? "" : "s"}${demoBlocking.some((m) => /\[security\//.test(m)) ? ", including security" : ""}.** Fix before merging:`, ...demoBlocking.map((m) => `> - ${m}`), ``] : []),
     `## What was asked`,
     ...((ctx.state.info.sources ?? []).length ? [`From: ${(ctx.state.info.sources ?? []).map((x) => (x.kind === "jira" ? `[${x.key}](${x.url})` : x.kind === "file" ? x.name : "typed prompt")).join(" + ")}`, ``] : []),
     ...(ctx.state.info.request ?? "").split("\n").map((l) => `> ${l}`),
@@ -290,6 +306,7 @@ export function prBody(ctx: Pick<StepContext, "state" | "runId">, a: { spec: Spe
     ...a.spec.requirements.map((r) => `- **${r.id}** ${r.ears}\n${r.acceptance.map((c) => {
       const test = a.lock.tests.find((t) => t.acId === c.id)?.testId;
       return test ? `  - ${c.id} (${PROOF[c.level] ?? c.level}): \`${test}\``
+        : a.byApi?.includes(c.id) ? `  - ${c.id} (${PROOF[c.level] ?? c.level}): proven by the API side of this product, not in this repo`
         : byHand.has(c.id) ? `  - ${c.id}: checked by hand and signed off by ${reviewed!.manualChecks!.by} (no automated test)` : `  - ${c.id}: checked by a person (no automated test)`;
     }).join("\n")}`),
     ``,
@@ -301,16 +318,28 @@ export function prBody(ctx: Pick<StepContext, "state" | "runId">, a: { spec: Spe
       `${a.plan.dataModel.tables.length} table${a.plan.dataModel.tables.length === 1 ? "" : "s"}, approved with the plan and kept in \`${DATA_MODEL_FILE}\`.${nearModel(a.plan.dataModel).others ? ` The diagram shows the tables this change adds or changes and the tables joined to them; ${nearModel(a.plan.dataModel).others} other${nearModel(a.plan.dataModel).others === 1 ? " is" : "s are"} unchanged.` : ""}`,
       ``, "```mermaid", erdMermaid(nearModel(a.plan.dataModel).model), "```", ``,
     ] : []),
+    // a locked contract this change added to (approved on the plan card): the web app is still built against the old one
+    ...(a.plan.contractAdded?.length ? [
+      `## API contract change`,
+      `This change adds ${a.plan.contractAdded.length} operation${a.plan.contractAdded.length === 1 ? "" : "s"} to the locked API contract, approved with the plan; nothing already in it changed:`,
+      ...a.plan.contractAdded.map((op) => `- ${op}`),
+      ``, `**The web app is built against the contract as it was: give it the new contract file before its next run.**`, ``,
+    ] : []),
     ...settingsSection(a.settings ?? []),
     `## Checks the factory ran itself`,
     `- ${a.run.results.length} tests in a sealed container; ${a.run.results.filter((r) => r.outcome === "passed").length} passed; no new failures vs the base branch`,
     `- Acceptance tests were written first, failed on the old code twice, then locked`,
     ...(a.lock.familyNote ? [`- ⚠ ${a.lock.familyNote}`] : []),
     // a locked test the test-or-code check found wrong and rewrote during the build (test-defect.ts): a person should read it
+    // a lenient run (lenientTests): tests left out of the checks; a person reads each before merging
+    ...(a.disputed ?? []).map((d) => `- ⚠ **Not proven: locked test left out** \`${d.file}\` (${d.testId}, ${d.acId}) ${d.by ? `by ${d.by}, who disputed it` : `at ${d.step.replace(/^implement\//, "")}: a check judged the test wrong and it could not be put right`}: ${d.why} Check ${d.acId} by hand before merging.`),
     ...(a.rewritten ?? []).map((j) => `- ⚠ Locked test rewritten during the build: \`${j.file}\` (${j.testId}, ${j.acId}). It failed twice at ${j.step.replace(/^implement\//, "")} and a check judged the test wrong: ${j.why} The rewrite failed again on the code before that task, was read against its criterion, and was locked again. The factory does not merge this pull request itself: read the rewrite, then merge.`),
+    // a file of another task the check opened to a task so its locked test could pass: a change outside the plan's list for that task
+    ...(a.opened ?? []).map((o) => `- ⚠ File opened to another task during the build: \`${o.file}\` was changed by ${o.step.replace(/^implement\//, "")}, which the plan did not list it for. Its locked test ${o.testId} (${o.acId}) failed twice and a check judged the test right and the file list too narrow: ${o.why}`),
     ...(flaky.length ? [`- ⚠ Flaky (passed only on re-run): ${flaky.join(", ")}`] : []),
     ...(written?.waivers ?? []).map((w) => `- ⚠ Waived by ${w.human}: ${w.gateIds.join(", ")} (${w.reason})${written?.acceptedUntested?.length ? `. No test covers ${written.acceptedUntested.join(", ")}` : ""}`),
     ...(reviewed?.waivers ?? []).map((w) => `- ⚠ Waived by ${w.human}: ${w.gateIds.join(", ")} (${w.reason})`),
+    ...(integrated?.waivers ?? []).map((w) => `- ⚠ Waived by ${w.human} at integrate: ${w.gateIds.join(", ")} (${w.reason})`),
     ...(weak.length ? [`- ⚠ ${weak.length} locked test${weak.length === 1 ? "" : "s"} the review judged not to prove ${weak.length === 1 ? "its criterion" : "their criteria"}. ${weak.length === 1 ? "It passes" : "They pass"}, and the run did not stop for ${weak.length === 1 ? "it" : "them"}:`, ...weak.map((w) => `  - ${w.acId}: the test is too weak (${w.why})`)] : []),
     `- Review: ${a.review.findings.length} non-blocking findings${a.review.note ? ` (${a.review.note})` : ""}`,
     ...a.review.findings.map((f) => `  - ${f.id} [${f.severity}] ${f.text}`),
@@ -478,7 +507,8 @@ export const deliverStep: StepDef = {
 
     const spec = requireOutput<Spec>(ctx.state, ctx.ledger, "specify");
     const plan = requireOutput<Plan>(ctx.state, ctx.ledger, "plan");
-    const body = prBody(ctx, { spec, plan, lock, run: requireOutput<TestRun>(ctx.state, ctx.ledger, "integrate"), review: requireOutput(ctx.state, ctx.ledger, "review"), manifestHash, commits, rewritten: rewrittenTests(ctx.ledger.events()), settings: await settingsNeeded(wt, changeBase(ctx.state), gated) })
+    const byApi = spec.requirements.flatMap((r) => r.acceptance.filter((c) => provedByApi(ctx.project, c)).map((c) => c.id));
+    const body = prBody(ctx, { spec, plan, lock, byApi, run: requireOutput<TestRun>(ctx.state, ctx.ledger, "integrate"), review: requireOutput(ctx.state, ctx.ledger, "review"), manifestHash, commits, rewritten: rewrittenTests(ctx.ledger.events()), disputed: disputedTests(ctx.ledger.events()), opened: openedFiles(ctx.ledger.events()), settings: await settingsNeeded(wt, changeBase(ctx.state), gated) })
       + followUpSection(readImpact(ctx.state, ctx.ledger));
     const jiraKey = ctx.state.info.sources?.find((s) => s.kind === "jira")?.key;
     const title = `${jiraKey ? `${jiraKey}: ` : "factory: "}${spec.requirements[0]?.ears.slice(0, 60) ?? ctx.runId}`;

@@ -34,7 +34,8 @@ export const designFidelityLint = defineGate<{ lint: CheckResult[] }>({
   id: "design.fidelity-lint", after: "implement", safety: false, waiver: "human",
   predicate: ({ lint }) => verdict(
     lint.filter((r) => r.status === "FAIL" || r.status === "UNCHECKED")
-      .map((r) => failure("design-fidelity", `${r.check}: ${r.status === "UNCHECKED" ? "could not check: " : ""}${r.detail}`)),
+      // with what was found: "1 arbitrary value(s)" alone left the implementer guessing which one (run 1679, twice)
+      .map((r) => failure("design-fidelity", `${r.check}: ${r.status === "UNCHECKED" ? "could not check: " : ""}${r.detail}${r.items?.length ? `: ${r.items.slice(0, 8).join("; ")}${r.items.length > 8 ? `; and ${r.items.length - 8} more` : ""}` : ""}`)),
     lint.map((r) => `${r.check} ${r.status}`).join("; ") || "nothing to check",
   ),
 });
@@ -142,10 +143,11 @@ export const screenScope = defineGate<{ plan: { tasks: Pick<PlanTask, "id" | "es
  * B1 for a build from an approved design (`--from-design`, no estimate): every plan task delivers requirements of the approved
  * spec, and none delivers one the design run did not approve (PR #11 review, item 10).
  */
-export const designScopeLock = defineGate<{ plan: { tasks: Pick<PlanTask, "id" | "reqs">[] }; approvedSpec: Pick<SpecDraft, "requirements"> }>({
+export const designScopeLock = defineGate<{ plan: { tasks: Pick<PlanTask, "id" | "reqs">[] }; approvedSpec: Pick<SpecDraft, "requirements"> & Partial<Pick<SpecDraft, "nfrs">> }>({
   id: "build.b1-design-scope", after: "plan", safety: false, waiver: "human",
   predicate: ({ plan, approvedSpec }) => {
-    const approved = new Set(approvedSpec.requirements.map((r) => r.id));
+    // the spec's non-functional requirements are approved with it: a set-up task delivers one (run c0aa: NFR-1 was refused three times)
+    const approved = new Set([...approvedSpec.requirements, ...(approvedSpec.nfrs ?? [])].map((r) => r.id));
     return verdict(
       plan.tasks.flatMap((t) => !t.reqs.length
         ? [failure("b1-unmapped", `plan task ${t.id} delivers no approved requirement`)]

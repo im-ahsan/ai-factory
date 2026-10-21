@@ -11,12 +11,13 @@ This works the same for all four kinds of run: estimate, design, brownfield and 
 ## The rules
 
 - **Asked once, at the start.** No step asks for a model mid-run, and a running run's models cannot be changed.
-- **Every step is listed**, helper steps included, and every one can be chosen. `critic` was fixed on Claude Opus 5.5 until 2026-10-12; it now has its own row like the others and still defaults to Claude Opus 5.5.
+- **Every step is listed**, helper steps included, and every one can be chosen. `critic` was fixed on Claude Opus 5.5 until 2026-10-12; it now has its own row like the others.
+- **The critic is off by default (2026-10-13).** Its row reads "Off (default)". Picking a model for it (`--model critic=claude-opus-5-5`, or its row in the start form) turns it on for that run, on that model. A project file `steps.critic` entry turns it on for every run of the project. A preset does not turn it on. With the critic off the spec is still checked by lint and the round trip; the cards say the critic did not run and list no findings. A run created before this keeps the critic it began with.
 - **Effort is not a choice.** Each step keeps its own effort.
 - **An OpenAI key is needed.** `specify-other` and `review` run on GPT-6 by default. Without `OPENAI_API_KEY` in `~/.factory/.env`, a new run does not start. It never falls back to Claude silently.
 - **Coding steps default to Claude.** `author-tests` and `implement` take Claude Sonnet 5.5, Claude Opus 5.5, GPT-6 Luna or GPT-6 Sol. The defaults and the presets keep them on Claude; a GPT-6 model is a pick. On a GPT-6 model a coding step runs in OpenAI's Codex agent, not the Claude one (see "Coding on GPT-6").
 - **`specify-other` must be a GPT-6 model.** It is the second spec draft, written by another vendor than the first. A Claude pick is refused.
-- **A spec step on the critic's own model is allowed, with a warning.** When `specify`, `specify-other` or `merge` ends up on the model `critic` runs on, the critic would read a spec its own model wrote. The warning follows the critic's model: with the critic on Claude Opus 5.5 it is about `specify` and `merge`; with the critic picked onto GPT-6 Sol it is about `specify-other`. The defaults are not warned about, only a run where one of these steps or the critic was moved.
+- **A spec step on the critic's own model is allowed, with a warning.** When `specify`, `specify-other` or `merge` ends up on the model `critic` runs on, the critic would read a spec its own model wrote. The warning follows the critic's model: with the critic on Claude Opus 5.5 it is about `specify` and `merge`; with the critic picked onto GPT-6 Sol it is about `specify-other`. The default models are not warned about, only a run where one of these steps or the critic is on another model than its default. So turning the critic on with Claude Opus 5.5 beside the default spec steps gives no warning. There is no warning while the critic is off.
 
 ## Where the model of a step comes from
 
@@ -30,6 +31,8 @@ The first of these that says something wins:
 | 4 | The project file's `steps:` entry | `config` |
 | 5 | A suggested tier (a hook for the planner and the decision layer; nothing suggests one yet) | `recommended`, `plan size` or `rule` |
 | 6 | The step's default | `default` |
+
+`critic` is the exception: with no pick (2) and no project file entry (4) it does not run, and is logged as `off`.
 
 ## Models and tiers
 
@@ -63,7 +66,7 @@ Claude Haiku 5.5 is not offered by name. A step reaches it through its tier or a
 | `merge` | thinking | Claude Opus 5.5 | heavy |
 | `restater` | thinking | Claude Sonnet 5.5 | standard |
 | `rt-align` | thinking | Claude Haiku 5.5 | light |
-| `critic` | review | Claude Opus 5.5 | heavy |
+| `critic` | review | off (Claude Opus 5.5 when the project file turns it on without naming another) | heavy |
 | `breakdown` | thinking | Claude Opus 5.5 | heavy |
 | `estimate` | thinking | Claude Opus 5.5 | heavy |
 | `design` | design | Claude Opus 5.5 | heavy |
@@ -94,7 +97,7 @@ A preset sets every step at once. Any step can still be changed by hand after it
 
 - A step already on the lowest or highest tier stays there.
 - `author-tests` never goes below the standard tier. The test writer decides what "done" means for the code.
-- `critic` never goes below the heavy tier, so a preset leaves it on Claude Opus 5.5. A pick or a project file entry moves it.
+- `critic` is off unless picked, and a preset does not turn it on. Turned on by the project file, it never goes below the heavy tier under a preset.
 - A step that moves tier takes that tier's effort. A step that stays keeps its own.
 
 Under Economy, `implement` runs on Claude Haiku 5.5. Pick a model for `implement` by hand if that is too low for the work.
@@ -118,7 +121,7 @@ factory start "Add an orders page" --project shop --preset economy --model plan=
 - `--preset economy|balanced|quality` sets every step.
 - `--model step=model` sets one step, and wins over the preset. Repeat it for more steps.
 - A group name sets every step of that group: `--model coding=claude-opus-5-5`. The groups are `thinking`, `design`, `coding` and `review`. A step's own name wins over a group of the same name (`design` is the step).
-- The `design` step can also be given **Google Stitch** (`--model design=stitch`, or "Google Stitch" in the form's design row): Stitch draws the screens, and a model plans them: it lists the screens, writes each screen's prompt and writes the design system. That model is the design tier's Claude model (Claude Opus 5.5 unless the project file sets `design.tier` or `design.tiers`). To name another, add it after a colon, `--model design=stitch:gpt-6-luna`, or choose it in the "planned by" list that appears beside Google Stitch in the form; any model the design step is offered can plan. It sends the requirements to Google: picking it allows that for the run, with no change to the project file (`design.allowStitch: true` is still needed when the project file itself names the engine, `design.engine: stitch`). `STITCH_API_KEY` must be set; otherwise the start is refused with the reason. The run keeps the engine it started with.
+- The `design` step can also be given **Google Stitch** (`--model design=stitch`, or "Google Stitch" in the form's design row): Stitch draws the screens, and a model plans them: it lists the screens, writes each screen's prompt and writes the design system. That model is the design tier's Claude model (Claude Opus 5.5 unless the project file sets `design.tier` or `design.tiers`). To name another, add it after a colon, `--model design=stitch:gpt-6-luna`, or choose it in the "planned by" list that appears beside Google Stitch in the form; any model the design step is offered can plan. It sends the requirements to Google: picking it allows that for the run, with no change to the project file (`design.allowStitch: true` is still needed when the project file itself names the engine, `design.engine: stitch`). `STITCH_API_KEY` must be set; otherwise the start is refused with the reason. The run keeps the engine it started with. Beside the planner, "mobile design" (Yes / No, or `--mobile-design true|false`) says whether the main pages are drawn at phone width too; it starts at the project's `design.stitch.phone`.
 - The `design` step can also be given **Model-drawn pages** (`--model design=pages:<model>`, or "Model-drawn pages" in the form's design row): the same screen list, design system, checks, preview and export as a Stitch design, with the named model writing each page's HTML in Stitch's place (`design=pages` alone uses the design tier's Claude model). Nothing is sent to Google and no Stitch key is needed; every page is one call to that model, paid by its tokens. A page is plain HTML and CSS with Google Fonts: no scripts, no pictures from the web. To compare the three ways on one requirement, start it three times: `design=stitch:<model>`, `design=pages:<gpt model>` and `design=pages:<claude model>`.
 
 To see what a run would use before starting it, at no cost:

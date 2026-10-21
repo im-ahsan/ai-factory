@@ -10,6 +10,34 @@ import type { FailureCategory } from "../gates/ladder.js";
 import type { Trace } from "../util/trace.js";
 import type { GateAnswer } from "./gate-questions.js";
 
+/**
+ * How many of a step's failures the ledger keeps for its next attempt. Twenty were kept once, so a retry was never told of
+ * the rest and the whole cycle ran again for them (run 1679: 52 weak tests found, 20 passed on).
+ */
+export const FAILURES_KEPT = 200;
+
+/**
+ * A step's failures as a briefing lists them: every one, the failures of one check together, up to a size. Past it the rest
+ * are counted by check, so the reader knows how many there are and of what kind.
+ */
+export function failureLines(failures: Failure[], maxChars = 16_000, frames = false): string {
+  const checks = [...new Set(failures.map((f) => f.check))];
+  const ordered = checks.flatMap((c) => failures.filter((f) => f.check === c));
+  const lines: string[] = [];
+  let used = 0, shown = 0;
+  for (const f of ordered) {
+    const line = `- [${f.check}] ${f.message}${frames && f.frames.length ? `\n    ${f.frames.join("\n    ")}` : ""}`;
+    if (shown && used + line.length > maxChars) break;
+    lines.push(line); used += line.length + 1; shown += 1;
+  }
+  const left = ordered.slice(shown);
+  if (left.length) {
+    const by = [...new Set(left.map((f) => f.check))].map((c) => `${left.filter((f) => f.check === c).length} × ${c}`);
+    lines.push(`… and ${left.length} more not shown (${failures.length} in all): ${by.join(", ")}. Fix the kinds above everywhere they occur, not only in the lines shown.`);
+  }
+  return lines.join("\n");
+}
+
 export type StepOutcome =
   /** outputs: named artifact shas (first is the main one). */
   | { kind: "done"; outputs: Record<string, string>; treeSha?: string; data?: Record<string, unknown> }
@@ -19,7 +47,7 @@ export type StepOutcome =
   /** data: small metadata stored on step.failed (e.g. the commit judged, how the attempt started).
    *  gate: a check on the step's output failed (not the model's answer, the code or the environment); in an estimate or a design run,
    *  after the retry, the failures become questions instead of more attempts (src/stages/gate-questions.ts). */
-  | { kind: "fail"; category: FailureCategory; failures: Failure[]; signature?: string; diffSha?: string; lockedFailedIds?: string[]; data?: Record<string, unknown>; gate?: boolean;
+  | { kind: "fail"; category: FailureCategory; failures: Failure[]; signature?: string; diffSha?: string; lockedFailedIds?: string[]; data?: Record<string, unknown>; gate?: boolean; holdRung?: boolean;
       /** the locked tests that failed cannot pass at this task (a later task completes what they run): failing twice is not "test or code wrong" */
       deferrable?: boolean;
       /** and each of them fails exactly as it did before the task started: they move to the later task on this failure, not the second */
@@ -46,6 +74,8 @@ export interface StepContext {
   /** failures from the previous attempt of this step (failures.json) */
   priorFailures: Failure[];
   log: (msg: string) => void;
+  /** a fact about this attempt for its summary in the ledger (the last attempt's work was kept or wiped, and why) */
+  note?: (name: string, value: string | number | boolean) => void;
   /** the run trace (model turns, tool calls, container phases); see src/util/trace.ts */
   trace: Trace;
   /** record model usage as it happens */

@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { contractDiff, contractGap, contractMatches, dataModelMatches, contractProblems, contractReadProblem, contractSummary, readContract } from "./contract.js";
+import { addToContract, contractAuthProblems, contractChange, contractDiff, contractGap, contractMatches, dataModelMatches, contractProblems, contractReadProblem, contractSummary, exampleProblems, readContract } from "./contract.js";
 import { DEFAULT_POLICY } from "./policy.js";
 
 // the document a .NET 9 minimal API wrote at build time, with no network (the spike of 2026-10-05)
@@ -37,6 +37,21 @@ const built = () => JSON.parse(builtText) as Record<string, any>;
 const gate = (b: string | undefined) => contractMatches.predicate({ contract: { text: CONTRACT }, built: { ...(b === undefined ? {} : { text: b }), path: "Api/openapi/built.json" } }, DEFAULT_POLICY);
 
 describe("the locked API contract", () => {
+  it("refuses an example that leaves out a required field or has another type, before the plan is approved (run b587)", () => {
+    const doc = { openapi: "3.0.3", paths: {}, components: { schemas: { Plan: { type: "object", required: ["id", "total", "reconciled"], properties: {
+      id: { type: "integer" }, total: { type: "number" }, reconciled: { type: "boolean" }, note: { type: "string", nullable: true }, lots: { type: "array", items: { $ref: "#/components/schemas/Lot" } } } },
+      Lot: { type: "object", required: ["lb"], properties: { lb: { type: "number" } } } } } };
+    const plan = { $ref: "#/components/schemas/Plan" };
+    expect(exampleProblems(doc, plan, { id: 1, total: 2, reconciled: true, note: null, lots: [{ lb: 1.5 }] }, "example")).toEqual([]);
+    expect(exampleProblems(doc, { type: "array", items: plan }, [{ id: 1, total: 2.5, lots: [{}] }], "example")).toEqual([
+      "example[0] has no reconciled, which the schema requires", "example[0].lots[0] has no lb, which the schema requires"]);
+    expect(exampleProblems(doc, plan, { id: "1", total: 2, reconciled: true }, "example")).toEqual(["example.id is a string, the schema says integer"]);
+    const withBad = readContract(CONTRACT)!;
+    const c = withBad.paths["/api/appointments/today"].get.responses["200"].content["application/json"];
+    c.example = Array.isArray(c.example) ? [{}] : {};
+    expect(contractProblems(withBad).join("\n")).toMatch(/GET \/api\/appointments\/today 200's example does not match its schema: .*which the schema requires/);
+  });
+
   it("reads YAML or JSON, lists its operations for the card, and refuses what is not OpenAPI", () => {
     expect(contractSummary(contract)).toEqual(["POST /api/sign-in -> 200, 400", "GET /api/appointments/today -> 200"]);
     expect(readContract(builtText)).toBeTruthy();
@@ -91,6 +106,73 @@ describe("the locked API contract", () => {
     expect(gate(JSON.stringify(noRoute)).passed).toBe(false);
     const more = built(); more.paths["/api/extra"] = { get: { responses: { "200": { description: "OK" } } } };
     expect(contractDiff(contract, more)).toEqual(["not in the contract: GET /api/extra"]);
+    expect(part(more)).toBe(false);
+  });
+
+  it("leaves out a later task's stubbed operation while a task is checked, but not at integrate (run 9071)", () => {
+    // the interface stubs map every operation from the start; the build documents one as a bare 200 with no body or request
+    const stubbed = built();
+    stubbed.paths["/api/appointments/today"] = { get: { tags: ["Stubs"], responses: { "200": { description: "OK" } } } };
+    stubbed.paths["/api/sign-in"] = { post: { responses: { "200": { description: "OK" } } } };
+    const part = (b: Record<string, any>) => contractMatches.predicate({ contract: { text: CONTRACT }, built: { text: JSON.stringify(b), path: "x", partial: true } }, DEFAULT_POLICY);
+    expect(part(stubbed)).toMatchObject({ passed: true });
+    expect(gate(JSON.stringify(stubbed)).passed).toBe(false);
+    // a built operation is still held to the contract: a body with a wrong field is no stub
+    const wrong = built(); wrong.components.schemas.Session.properties.userId = { type: "string" };
+    expect(part(wrong).passed).toBe(false);
+  });
+
+  it("reads a shared answer, a shared request body and allOf around a pointer as what they point at (runs e8ef, e1b5)", () => {
+    // the same contract as CONTRACT, written the way planners write it: the 400 answer and the request body kept once under
+    // components, and a field's type given as allOf around a pointer so it can carry a description
+    const shared = readContract(CONTRACT)!;
+    const post = shared.paths["/api/sign-in"].post;
+    shared.components.responses = { BadEmail: post.responses["400"] };
+    post.responses["400"] = { $ref: "#/components/responses/BadEmail" };
+    shared.components.requestBodies = { SignIn: post.requestBody };
+    post.requestBody = { $ref: "#/components/requestBodies/SignIn" };
+    shared.components.schemas.Status = { type: "string" };
+    shared.components.schemas.Appointment.properties.status = { allOf: [{ $ref: "#/components/schemas/Status" }], description: "Confirmed or not" };
+    // an API that says what the contract says matches, either way round
+    expect(contractDiff(shared, built())).toEqual([]);
+    expect(contractDiff(contract, shared)).toEqual([]);
+    expect(contractProblems(shared)).toEqual([]);
+    // and the shared answer's body is held: an API that declares the status with no body does not match
+    const noBody = built();
+    delete noBody.paths["/api/sign-in"].post.responses["400"].content;
+    expect(contractDiff(shared, noBody)).toEqual(["missing in the API: POST /api/sign-in 400 body"]);
+    // a nullable pointer written as oneOf with "or null" is the type it points at
+    const nullable = built();
+    nullable.components.schemas.Appointment.properties.status = { oneOf: [{ nullable: true }, { $ref: "#/components/schemas/Status" }] };
+    nullable.components.schemas.Status = { type: "string" };
+    expect(contractDiff(shared, nullable)).toEqual([]);
+  });
+
+  it("reads .NET's pointer to a list's items inside the same schema as that list's items (run 768d, 4 attempts)", () => {
+    const doc = (second: object) => JSON.stringify({ openapi: "3.0.1", info: { title: "a", version: "1" },
+      paths: { "/load": { post: { operationId: "load", responses: { "200": { description: "ok", content: { "application/json": { schema: { $ref: "#/components/schemas/Load" } } } } } } } },
+      components: { schemas: { Outcome: { type: "object", properties: { id: { type: "integer" } } },
+        Load: { type: "object", properties: { added: { type: "array", items: { $ref: "#/components/schemas/Outcome" } }, failed: { type: "array", items: second } } } } } });
+    const contract = readContract(doc({ $ref: "#/components/schemas/Outcome" }))!;
+    expect(contractDiff(contract, readContract(doc({ $ref: "#/components/schemas/#/properties/added/items" }))!)).toEqual([]);
+  });
+
+  it("reads a field given only as a list of allowed values as the type of those values (run e8ef, TASK-1 attempt 4)", () => {
+    // a .NET enum field comes out of the build as { enum: [...] } with no type; the contract says string
+    const listed = built();
+    listed.components.schemas.Appointment.properties.status = { enum: ["Confirmed", "Cancelled"] };
+    expect(contractDiff(contract, listed)).toEqual([]);
+    // values of another type are still a difference, and a list of mixed types is no type at all
+    const numbers = built();
+    numbers.components.schemas.Appointment.properties.status = { enum: [0, 1] };
+    expect(contractDiff(contract, numbers)).toEqual(["GET /api/appointments/today 200 body[].status: the contract says string, the API has integer"]);
+    const mixed = built();
+    mixed.components.schemas.Appointment.properties.status = { enum: ["Confirmed", 1] };
+    expect(contractDiff(contract, mixed)).toEqual(["GET /api/appointments/today 200 body[].status: the contract says string, the API has any"]);
+  });
+
+  it("says how much it compared, so a pass can be told from a pass on nothing", () => {
+    expect(gate(builtText)).toMatchObject({ passed: true, facts: { operationsInContract: 2, operationsInApi: 2, differences: 0, partial: false } });
   });
 
   it("fails plainly when the build wrote no document", () => {
@@ -160,5 +242,135 @@ describe("the built database against the approved data model: what an existing b
     const r = gate([t("Orders")], { note: "the app started but created no SQLite database file on startup", noDatabaseBefore: true });
     expect(r.passed).toBe(true);
     expect(r.details).toMatch(/Not compared: the code before this run created no database on startup either/);
+  });
+});
+
+describe("adding to a locked contract (run 3406)", () => {
+  const LOCKED = `openapi: 3.0.3
+info: { title: Orders, version: "1" }
+# the orders API: comments and layout stay
+paths:
+  /accounts:
+    get:
+      operationId: listAccounts
+      responses:
+        "200": { description: ok, content: { application/json: { schema: { $ref: "#/components/schemas/Account" }, example: { id: 1 } } } }
+components:
+  schemas:
+    Account: { type: object, required: [id], properties: { id: { type: integer } } }
+`;
+  const SIGN_UP = `paths:
+  /auth/sign-up:
+    post:
+      operationId: signUp
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SignUp" } } } }
+      responses:
+        "201": { description: created, content: { application/json: { schema: { $ref: "#/components/schemas/Account" }, example: { id: 2 } } } }
+components:
+  schemas:
+    SignUp: { type: object, required: [email], properties: { email: { type: string } } }
+`;
+
+  it("adds new operations and schemas, keeps the rest of the file as it was, and reports only additions", () => {
+    const r = addToContract(LOCKED, SIGN_UP);
+    expect(r.problems).toEqual([]);
+    expect(r.text).toContain("# the orders API: comments and layout stay");
+    const doc = readContract(r.text)!;
+    expect(contractProblems(doc)).toEqual([]);
+    expect(contractChange(readContract(LOCKED)!, doc)).toEqual({ added: ["POST /auth/sign-up"], changed: [] });
+    // a new method on a path that is already there is an addition too
+    const r2 = addToContract(LOCKED, `paths:\n  /accounts:\n    post: { operationId: createAccount, responses: { "201": { description: created } } }\n`);
+    expect(r2.problems).toEqual([]);
+    expect(contractChange(readContract(LOCKED)!, readContract(r2.text)!).added).toEqual(["POST /accounts"]);
+  });
+
+  it("refuses to replace an operation or a component that is already there", () => {
+    const r = addToContract(LOCKED, `paths:\n  /accounts:\n    get: { operationId: listAll, responses: { "200": { description: ok } } }\ncomponents:\n  schemas:\n    Account: { type: object }\n`);
+    expect(r.problems.join("\n")).toMatch(/GET \/accounts is already in the contract/);
+    expect(r.problems.join("\n")).toMatch(/components.schemas.Account is already in the contract with other content/);
+    expect(addToContract(LOCKED, "info: {}").problems[0]).toMatch(/needs "paths"/);
+  });
+
+  it("names every change to an operation that was already there", () => {
+    const before = readContract(LOCKED)!;
+    const after = readContract(LOCKED.replace("operationId: listAccounts", "operationId: accounts").replace('"200":', '"201":'))!;
+    const c = contractChange(before, after);
+    expect(c.added).toEqual([]);
+    expect(c.changed.join("\n")).toMatch(/GET \/accounts operationId: was listAccounts, now accounts/);
+    expect(c.changed.join("\n")).toMatch(/removed: GET \/accounts 200/);
+    expect(c.changed.join("\n")).toMatch(/added to an operation already in the contract: GET \/accounts 201/);
+  });
+});
+
+describe("a contract that needs a login says how to get one", () => {
+  const doc = (extra: string) => readContract(`openapi: 3.0.3
+info:
+  title: Shop
+  version: "1"
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+paths:
+  /orders:
+    get:
+      operationId: listOrders
+      responses:
+        "200":
+          description: ok
+${extra}`)!;
+  it("fails with no open sign-up or log-in", () => {
+    expect(contractAuthProblems(doc(""))[0]).toMatch(/sign up or log in/);
+  });
+  it("fails when the log-in itself needs a login", () => {
+    const d = doc(`  /auth/register:
+    post:
+      operationId: register
+      security: []
+      responses:
+        "201":
+          description: ok
+  /auth/login:
+    post:
+      operationId: login
+      responses:
+        "200":
+          description: ok
+`);
+    expect(contractAuthProblems(d)[0]).toMatch(/log in: add POST \/auth\/login/);
+  });
+  it("passes with open register and login, or with no login at all", () => {
+    const d = doc(`  /auth/register:
+    post:
+      operationId: register
+      security: []
+      responses:
+        "201":
+          description: ok
+  /auth/login:
+    post:
+      operationId: login
+      security: []
+      responses:
+        "200":
+          description: ok
+`);
+    expect(contractAuthProblems(d)).toEqual([]);
+    expect(contractAuthProblems(readContract(`openapi: 3.0.3
+info:
+  title: Shop
+  version: "1"
+paths:
+  /orders:
+    get:
+      operationId: listOrders
+      responses:
+        "200":
+          description: ok
+`)!)).toEqual([]);
   });
 });

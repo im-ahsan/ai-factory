@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { addWorktree, authEnv, changedFiles, commitAll, commitWith, diffIncludingUntracked, excludeLocally, fetchForGate, freshWorktree, git, headSha, pathChangedSince, removeWorktree, repoRefusals, resetHard, trackIgnored } from "./git.js";
+import { addWorktree, authEnv, cleanIgnored, changedFiles, commitAll, commitFiles, commitWith, diffIncludingUntracked, excludeLocally, fetchForGate, freshWorktree, git, headSha, pathChangedSince, removeWorktree, repoRefusals, resetHard, trackIgnored } from "./git.js";
 
 function makeRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "factory-git-"));
@@ -14,6 +14,20 @@ function makeRepo(): string {
   execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: dir, env });
   return dir;
 }
+
+describe("cleaning build output", () => {
+  it("removes ignored files but keeps the paths it is told to keep", async () => {
+    const d = mkdtempSync(join(tmpdir(), "factory-clean-"));
+    const g = (...a: string[]) => execFileSync("git", a, { cwd: d, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" } });
+    g("init", "-q");
+    writeFileSync(join(d, ".gitignore"), "node_modules/\n.next/\n");
+    mkdirSync(join(d, "node_modules", "pkg"), { recursive: true }); writeFileSync(join(d, "node_modules", "pkg", "x"), "");
+    mkdirSync(join(d, ".next")); writeFileSync(join(d, ".next", "y"), "");
+    await cleanIgnored(d, ["node_modules"]);
+    expect(existsSync(join(d, "node_modules", "pkg", "x"))).toBe(true);
+    expect(existsSync(join(d, ".next"))).toBe(false);
+  });
+});
 
 describe("hardened git", () => {
   it("never runs repo hooks", async () => {
@@ -36,6 +50,16 @@ describe("hardened git", () => {
     await commitAll(repo, "change");
     expect(await pathChangedSince(repo, base, "a.txt")).toBe(true);
     expect(await pathChangedSince(repo, await headSha(repo), "a.txt")).toBe(false);
+  });
+
+  it("commits files from their text on top of a commit, with no checkout involved", async () => {
+    const repo = makeRepo();
+    const base = await headSha(repo);
+    const at = await commitFiles(repo, base, [{ path: "src/New.cs", content: "class New { }\n" }, { path: "a.txt", content: "two\n" }], "stubs");
+    expect(await changedFiles(repo, base, at)).toEqual([{ status: "M", path: "a.txt" }, { status: "A", path: "src/New.cs" }]);
+    expect((await git(repo, ["show", `${at}:src/New.cs`])).stdout).toBe("class New { }\n");
+    expect(await headSha(repo)).toBe(base);
+    expect((await git(repo, ["status", "--porcelain"])).stdout).toBe("");
   });
 
   it("commits named files on top of a commit without moving the checkout", async () => {

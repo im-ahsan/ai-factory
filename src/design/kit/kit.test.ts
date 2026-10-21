@@ -21,6 +21,25 @@ const mem = (files: Record<string, string>): FileSource => ({ list: () => Object
 const exportsOf = (text: string) => [...text.matchAll(/export\s+(?:async\s+)?(?:function|const|class|interface|type)\s+(\w+)/g)].map((m) => m[1]!)
   .concat([...text.matchAll(/export\s*\{([^}]+)\}/g)].flatMap((m) => m[1]!.split(",").map((x) => x.trim().split(/\s+as\s+/).pop()!.replace(/^type\s+/, ""))));
 
+/** A test file for a scaffolded app: every screen, live and in each of its states (layers and toasts are states too), rendered the way a screen test renders it. */
+const renderEveryScreen = (screens: { id: string; container: string; containerName: string; states: Record<string, string> }[], next: boolean): string => [
+  // the name is put in here so that vitest does not read this file itself as a jsdom test
+  `// @vitest-environment ${"jsdom"}`,
+  `import { render } from "@testing-library/react";`,
+  `import { expect, it } from "vitest";`,
+  ...screens.map((s) => `import { ${s.containerName} } from "@/${s.container.replace(/^src\//, "").replace(/\.tsx$/, "")}";`),
+  ...screens.flatMap((s) => [undefined, ...Object.keys(s.states)].map((state) =>
+    `it(${JSON.stringify(`${s.id} ${state ?? "live"}`)}, () => { render(<${s.containerName} fixture={${JSON.stringify(state)}} />); expect(document.body.textContent).not.toBe(""); });`)),
+  // and a page that reaches the router directly: it renders, reads the address the test set and its navigation is recorded
+  `import { fireEvent } from "@testing-library/react";`,
+  `import { at, nav } from "./support/screen";`,
+  next
+    ? `import NextLink from "next/link";\nimport { usePathname, useRouter, useSearchParams } from "next/navigation";\nconst Direct = () => { const r = useRouter(); return <><p>{usePathname()}|{useSearchParams().get("tab")}</p><button onClick={() => r.push("/x")}>go</button><NextLink href="/y">y</NextLink></>; };`
+    : `import { Link as RouterLink, useLocation, useNavigate, useSearchParams } from "react-router";\nconst Direct = () => { const go = useNavigate(); const [q] = useSearchParams(); return <><p>{useLocation().pathname}|{q.get("tab")}</p><button onClick={() => go("/x")}>go</button><RouterLink to="/y">y</RouterLink></>; };`,
+  `it("the router used directly", () => { at("/orders/7", { tab: "paid" }); const { getByText } = render(<Direct />); expect(getByText("/orders/7|paid")).toBeTruthy(); fireEvent.click(getByText("go")); fireEvent.click(getByText("y")); expect(nav.went).toEqual(["/x", "/y"]); });`,
+  ``,
+].join("\n");
+
 describe("the shadcn kit", () => {
   it("pins every package exactly and carries shadcn/ui's licence with its components (PR #11 review, item 19)", () => {
     const m = kit.manifest;
@@ -137,6 +156,18 @@ describe("the scaffold", () => {
     expect(routerPath("/accounts/[id]")).toBe("/accounts/:id");
   });
 
+  it("a sample record's ID in a designed route is a route for every record (run 3f0f: only D-4823 had a page)", () => {
+    expect(nextRouteDir("/dispatch/deliveries/D-4823")).toBe("dispatch/deliveries/[id]");
+    expect(nextRouteDir("/dispatch/deliveries/D-4819/reschedule")).toBe("dispatch/deliveries/[id]/reschedule");
+    expect(nextRouteDir("/admin/fleet/V-04/maintenance/new")).toBe("admin/fleet/[id]/maintenance/new");
+    expect(nextRouteDir("/track/tk-4823")).toBe("track/[id]");
+    expect(nextRouteDir("/orders/1042/items/77")).toBe("orders/[id]/items/[id2]");
+    expect(routerPath("/customer/shipments/D-4823")).toBe("/customer/shipments/:id");
+    // words of the address stay
+    expect(nextRouteDir("/api/v2/new")).toBe("api/v2/new");
+    expect(nextRouteDir("/onboarding/step-1")).toBe("onboarding/step-1");
+  });
+
   it("a fresh Next.js app: the kit, the theme, a page per web screen with its blocks, states and fixtures, and the app around them", () => {
     const l = scaffold({ ...base, target: "next-shadcn" });
     expect(l.fresh).toBe(true);
@@ -184,9 +215,58 @@ describe("the scaffold", () => {
       expect(file("vitest.config.ts").text).toContain(`setupFiles: ["tests/support/setup.ts"]`);
       expect(file("vitest.config.ts").text).toContain(`oxc: { jsx: { runtime: "automatic" } }`);
       expect(file(SCREEN_SETUP).text).toContain(`vi.mock("@/lib/nav"`);
+      // run 4049: the writers used toBeVisible and every screen test crashed without the matchers
+      expect(file(SCREEN_SETUP).text).toContain(`import "@testing-library/jest-dom/vitest";`);
+      // render() gives a page what the frame gives it, and both parts are in the kit
+      expect(file(SCREEN_SETUP).text).toContain(`vi.mock("@testing-library/react"`);
+      for (const part of ["tooltip", "sonner"]) {
+        expect(file(SCREEN_SETUP).text).toContain(`@/components/ui/${part}`);
+        expect(l.files.some((f) => f.path.endsWith(`components/ui/${part}.tsx`)), part).toBe(true);
+      }
       expect(file(SCREEN_HELPER).text).toContain("export const nav");
+      // a page that uses the router's own package, not lib/nav, gets the stand-in of the target's router and never the other's
+      for (const [pkg, mine] of [["next/navigation", target === "next-shadcn"], ["next/link", target === "next-shadcn"], ["react-router", target === "vite-shadcn"]] as const)
+        expect(file(SCREEN_SETUP).text.includes(`vi.mock("${pkg}"`), `${target} ${pkg}`).toBe(mine);
       expect(l.protected).toEqual(expect.arrayContaining([SCREEN_SETUP, SCREEN_HELPER]));
     }
+  });
+
+  it("the frame's navigation leaves out signing in and up (run 4049 listed both on every page)", () => {
+    const auth = (id: string, route: string) => ({ ...design.screens.find((s) => s.id === "S-3")!, id, route, file: `app${route}/page.tsx`, group: undefined });
+    const l = scaffold({ ...base, target: "next-shadcn", design: { ...design, screens: [...design.screens, auth("S-8", "/sign-in"), auth("S-9", "/sign-up")] } });
+    const frame = l.files.find((f) => f.path === "components/screens/frame.ts")!.text;
+    expect(l.screens.map((s) => s.route)).toEqual(expect.arrayContaining(["/sign-in", "/sign-up"]));
+    expect(frame).toContain(`"route": "/settings"`);
+    expect(frame).not.toContain(`"route": "/sign-in"`);
+    expect(frame).not.toContain(`"route": "/sign-up"`);
+    // shown without the frame (run 4049's sign-in listed the pages, and their prefetched redirect sent the person back there)
+    expect(frame).toMatch(/"auth": \[\s*"\/sign-in",\s*"\/sign-up"\s*\]/);
+    expect(l.files.find((f) => f.path === "components/frame/app-frame.tsx")!.text).toContain("app.auth?.some(");
+  });
+
+  it("with no page at \"/\", the address opens the first page listed (run 4049's \"/\" was a 404)", () => {
+    const page = (id: string, route: string) => ({ ...design.screens.find((s) => s.id === "S-3")!, id, route, file: `app${route}/page.tsx`, group: undefined });
+    const screens = [page("S-1", "/sign-in"), page("S-2", "/dashboard"), page("S-3", "/admin/settings")];
+    const next = scaffold({ ...base, target: "next-shadcn", design: { ...design, screens } });
+    expect(next.files.find((f) => f.path === "app/page.tsx")!.text).toContain(`redirect("/dashboard")`);
+    const vite = scaffold({ ...base, target: "vite-shadcn", design: { ...design, screens } }).files.find((f) => f.path.endsWith("design-routes.tsx"))!.text;
+    expect(vite).toContain(`{ path: "/", element: <Navigate to="/dashboard" replace /> }`);
+    expect(vite).toContain(`import { Navigate, useSearchParams`);
+    // a design with its own page at "/" keeps it
+    const own = scaffold({ ...base, target: "next-shadcn", design: { ...design, screens: [page("S-1", "/"), page("S-2", "/dashboard")] } });
+    expect(own.files.find((f) => f.path === "app/page.tsx")!.text).not.toContain("redirect(");
+  });
+
+  it("each nav item carries its page's kind of user, and the kit gives the sign-in a place to store it (run 4049 listed every page to everyone)", () => {
+    const page = (id: string, route: string, user?: string) => ({ ...design.screens.find((s) => s.id === "S-3")!, id, route, file: `app${route}/page.tsx`, group: undefined, ...(user ? { user } : {}) });
+    const l = scaffold({ ...base, target: "next-shadcn", design: { ...design, screens: [page("S-1", "/sign-in"), page("S-2", "/dashboard", "employee"), page("S-3", "/admin/settings", "admin")] } });
+    const frame = l.files.find((f) => f.path === "components/screens/frame.ts")!.text;
+    const apps = JSON.parse(frame.slice(frame.indexOf("= [") + 2, frame.lastIndexOf("]") + 1)) as { nav: { route: string; roles?: string[] }[] }[];
+    expect(apps[0]!.nav).toEqual([expect.objectContaining({ route: "/dashboard", roles: ["employee"] }), expect.objectContaining({ route: "/admin/settings", roles: ["admin"] })]);
+    expect(l.files.find((f) => f.path === "lib/session-role.ts")?.text).toContain("export function setSessionRole");
+    expect(l.files.find((f) => f.path === "components/frame/app-frame.tsx")?.text).toContain("getSessionRole()");
+    // a design with no kinds of user lists its pages as before
+    expect(scaffold({ ...base, target: "next-shadcn" }).files.find((f) => f.path === "components/screens/frame.ts")!.text).not.toContain(`"roles"`);
   });
 
   it("screen tests are ready only when the checkout has the packages and the setup file", () => {
@@ -255,8 +335,14 @@ describe("the scaffold", () => {
     for (const target of ["vite-shadcn", "next-shadcn"] as const) {
       const dir = mkdtempSync(join(tmpdir(), `kit-${target}-`));
       try {
-        writeScaffold(scaffold({ ...base, target }), dir);
+        const l = scaffold({ ...base, target });
+        writeScaffold(l, dir);
+        writeFileSync(join(dir, "tests/kit-render.test.tsx"), renderEveryScreen(l.screens, target === "next-shadcn"));
         execFileSync("npm", ["install", "--no-audit", "--no-fund"], { cwd: dir, stdio: "pipe" });
+        // every screen renders on its own in every state it has, with only what the test setup puts around it
+        try { execFileSync("npx", ["vitest", "run"], { cwd: dir, stdio: "pipe" }); }
+        catch (e) { throw new Error(`${target}: a screen does not render in a test\n${String((e as { stdout?: Buffer }).stdout ?? e).slice(-4000)}`); }
+        rmSync(join(dir, "tests/kit-render.test.tsx"));
         execFileSync("npx", target === "vite-shadcn" ? ["vite", "build"] : ["next", "build"], { cwd: dir, stdio: "pipe", env: { ...process.env, NEXT_TELEMETRY_DISABLED: "1" } });
         // every kit file typechecks in both targets (after the build, which writes next-env.d.ts)
         execFileSync("npx", ["tsc", "-p", ".", "--noEmit"], { cwd: dir, stdio: "pipe" });

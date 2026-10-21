@@ -95,6 +95,47 @@ export const IntentBody = z.object({
 export const Intent = withHeader(IntentBody.shape);
 export type Intent = z.infer<typeof Intent>;
 
+/** A Google Meet transcript (Gemini notes export), parsed by code (src/sources/transcript.ts). */
+export const Turn = z.object({ id: Id, time: z.string(), speaker: z.string(), text: z.string() });
+export type Turn = z.infer<typeof Turn>;
+export const Transcript = z.object({
+  format: z.literal("gemini-meet"), title: z.string().optional(), date: z.string().optional(),
+  /** Gemini's own notes: unverified, a pointer for the model, never evidence */
+  notes: z.string(), turns: z.array(Turn).min(1), speakers: z.array(z.string()),
+});
+export type Transcript = z.infer<typeof Transcript>;
+
+export const IntentStatus = z.enum(["decided", "deferred", "excluded", "open"]);
+export type IntentStatus = z.infer<typeof IntentStatus>;
+export const SpeakerRole = z.object({ name: z.string(), role: z.enum(["client", "team"]), source: z.enum(["roster", "default", "card"]) });
+export type SpeakerRole = z.infer<typeof SpeakerRole>;
+
+/** distill: the model's answer (speaker and role are filled in by code from the turn). */
+export const DistillOut = z.object({
+  project: z.object({ name: z.string().optional(), goal: z.string() }),
+  requirements: z.array(z.object({ id: Id, text: z.string(), status: IntentStatus, quote: z.string(), turn: Id, supersedes: z.array(z.string()).optional() })),
+  constraints: z.array(z.object({ id: Id, text: z.string(), quote: z.string().optional(), turn: Id.optional() })),
+  openQuestions: z.array(z.object({ id: Id, text: z.string(), turn: Id.optional() })),
+  warnings: z.array(z.string()),
+});
+export type DistillOut = z.infer<typeof DistillOut>;
+
+/** distill: the client intent as stored and shown on the intent card. */
+export const ClientIntentBody = DistillOut.extend({
+  requirements: z.array(z.object({
+    id: Id, text: z.string(), status: IntentStatus, quote: z.string().optional(), turn: Id.optional(), supersedes: z.array(z.string()).optional(),
+    speaker: z.string().optional(), role: z.enum(["client", "team"]).optional(),
+    addedBy: z.object({ by: z.string(), note: z.string() }).optional(),
+  })),
+  speakers: z.array(SpeakerRole),
+  dropped: z.array(z.object({ id: Id, text: z.string(), quote: z.string(), turn: z.string(), why: z.string() })),
+  skill: z.object({ name: z.string(), sha256: z.string() }),
+  edits: z.number().int().min(0),
+});
+export type ClientIntentBody = z.infer<typeof ClientIntentBody>;
+export const ClientIntent = withHeader(ClientIntentBody.shape);
+export type ClientIntent = z.infer<typeof ClientIntent>;
+
 /** ground: claims about today's behaviour, each anchored to file lines (+ symbol). */
 export const CurrentBehaviourBody = z.object({
   claims: z.array(z.object({
@@ -483,6 +524,8 @@ export type MockBlock = z.infer<typeof MockBlock>;
 
 export const DesignBody = z.object({
   flow: z.string(),
+  /** the product's name as its pages show it (Folio3 Parking), for the frame and the page title */
+  product: z.string().optional(),
   screens: z.array(z.object({
     id: Id, route: z.string(), file: z.string(), reqs: z.array(Id),
     states: z.array(z.string()).optional(), size: z.enum(["new", "tweak", "design-system", "reuse"]).optional(), frames: z.array(z.string()).optional(),
@@ -491,10 +534,14 @@ export const DesignBody = z.object({
     app: z.string().optional(),
     /** the navigation group it is listed under in a sidebar or drawer */
     group: z.string().optional(),
+    /** the kind of user whose pages these are (a Stitch plan's shell: employee, admin); absent, a page for everyone (sign-in) */
+    user: z.string().optional(),
     /** the design references (R-1, ...) that shaped this screen */
     refs: z.array(z.string()).optional(),
     /** a design note's words for what changes on this page (no mock is drawn) */
     change: z.string().optional(),
+    /** a Stitch screen: what opens over it (each drawn as a frame of the screen, state overlay-<n>); a JSON screen's overlays are in its mock */
+    overlays: z.array(z.object({ kind: z.string(), title: z.string(), trigger: z.string(), content: z.string().optional() })).optional(),
     /** a Stitch screen: the words read from its HTML (src/design/stitch-facts.ts), its stand-in for the design JSON in tests and checks */
     facts: z.object({
       title: z.string().optional(), buttons: z.array(z.string()), fields: z.array(z.string()), columns: z.array(z.string()), headings: z.array(z.string()),
@@ -562,8 +609,17 @@ export const ImpactBody = z.object({
 export const Impact = withHeader(ImpactBody.shape);
 export type Impact = z.infer<typeof Impact>;
 
+/**
+ * A requirement as a plan task names it: the id alone. A model that writes the id and then what the task does with it
+ * ("REQ-1 — include sign-in ...") meant that id (run 3406: every requirement read as uncovered, twice, and the run parked).
+ */
+export function leadingId(v: unknown): unknown {
+  const m = typeof v === "string" ? /^\s*([A-Z][A-Z0-9]*-\d+)(?![\w-])/.exec(v) : null;
+  return m ? m[1] : v;
+}
+
 export const PlanTask = z.object({
-  id: Id, title: z.string(), reqs: z.array(Id), fileScope: z.array(z.string()).min(1),
+  id: Id, title: z.string(), reqs: z.array(z.preprocess(leadingId, Id)), fileScope: z.array(z.string()).min(1),
   exemplars: z.array(z.string()), conventions: z.array(Id),
   dependsOn: z.array(Id), plannedLoc: z.number().int().nonnegative(),
   newFileKind: z.boolean().optional(),
@@ -634,8 +690,14 @@ export const PlanBody = z.object({
   stubs: z.preprocess(tidyStubs, z.array(InterfaceStub)).default([]),
   /** a backend plan's tables, columns and keys (required where the plan sets up or changes stored data) */
   dataModel: DataModel.optional(),
+  /** a repo with a locked API contract: the operations the spec needs that it lacks, as OpenAPI YAML (`paths`, new `components`) */
+  contractAdditions: z.string().optional(),
 });
-export const Plan = withHeader({ ...PlanBody.shape, complexity: Complexity });
+export const Plan = withHeader({
+  ...PlanBody.shape, complexity: Complexity,
+  /** the operations `contractAdditions` adds to the locked contract (approved on the plan card; the merged file is a stub) */
+  contractAdded: z.array(z.string()).optional(),
+});
 export type Plan = z.infer<typeof Plan>;
 
 export const Approval = withHeader({

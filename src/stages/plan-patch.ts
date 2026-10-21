@@ -2,6 +2,7 @@
 // change. On the web run of 2026-10-06 two uncovered requirements made the planner rewrite 51,000 output tokens ($1.30).
 import { z } from "zod";
 import { DataModel, InterfaceStub, PlanBody, PlanTask } from "../contracts/index.js";
+import { mendAnswer, zodIssues } from "../runners/api.js";
 
 type Plan = z.infer<typeof PlanBody>;
 
@@ -23,13 +24,15 @@ export const PlanPatch = z.object({
   newDependencies: z.array(z.object({ name: z.string(), version: z.string(), registry: z.string() })).optional(),
   /** the data model, whole, only when it changes */
   dataModel: DataModel.optional(),
+  /** the new operations for a locked contract, whole, only when they change */
+  contractAdditions: z.string().optional(),
 });
 export type PlanPatch = z.infer<typeof PlanPatch>;
 
 export const PATCH_RULES = `THE PLAN IS FIXED, NOT REWRITTEN. "previous-plan" is the plan you wrote; it failed the checks listed under the failures. Return only what changes, and everything you leave out stays as it is:
 - tasks: each task that changes, or a new task, written whole. A task keeps its place by id; a new task goes last (give "order", every task id in the new order, only when the order must change). dropTasks: ids of tasks to remove.
 - stubs: a stub file that is new or mostly rewritten, written whole. stubEdits: a small change in a stub that stays, as { path, find, replace }, where "find" is text copied exactly from that file that occurs in it once. dropStubs: paths of stubs to remove.
-- options, chosen, adr, protectedPathsDeclared, newDependencies, dataModel: give one only when it changes (then whole).
+- options, chosen, adr, protectedPathsDeclared, newDependencies, dataModel, contractAdditions: give one only when it changes (then whole).
 Change nothing the failures do not ask for.`;
 
 /** The previous plan with the patch applied, or why it cannot be applied (the caller then asks for a whole plan). */
@@ -61,7 +64,7 @@ export function applyPlanPatch(prev: Plan, p: PlanPatch): { plan: Plan } | { pro
     stubs[i] = { ...stubs[i]!, content: stubs[i]!.content.replace(e.find, () => e.replace) };
   }
   const nothing = !p.tasks.length && !p.dropTasks.length && !p.order && !p.stubs.length && !p.stubEdits.length && !p.dropStubs.length
-    && [p.options, p.chosen, p.adr, p.protectedPathsDeclared, p.newDependencies, p.dataModel].every((x) => x === undefined);
+    && [p.options, p.chosen, p.adr, p.protectedPathsDeclared, p.newDependencies, p.dataModel, p.contractAdditions].every((x) => x === undefined);
   if (nothing) return { problem: "the patch changes nothing" };
   return {
     plan: {
@@ -69,6 +72,28 @@ export function applyPlanPatch(prev: Plan, p: PlanPatch): { plan: Plan } | { pro
       options: p.options ?? prev.options, chosen: p.chosen ?? prev.chosen, adr: p.adr ?? prev.adr,
       protectedPathsDeclared: p.protectedPathsDeclared ?? prev.protectedPathsDeclared, newDependencies: p.newDependencies ?? prev.newDependencies,
       ...(p.dataModel ?? prev.dataModel ? { dataModel: p.dataModel ?? prev.dataModel } : {}),
+      ...(p.contractAdditions ?? prev.contractAdditions ? { contractAdditions: p.contractAdditions ?? prev.contractAdditions } : {}),
     },
   };
+}
+
+export const SHAPE_RULES = `"previous-plan" here is the plan as you sent it: it was not accepted because its shape does not match the schema, and the failures say where (a path such as tasks.3.complexity is the fourth task's complexity). Its content was not judged. Return the task or stub that holds each fault, written whole and in the right shape; do not rewrite a part the failures do not name.`;
+
+/**
+ * A plan the schema refused, with a patch applied: the plan when it now matches the schema, or what is still wrong (with the
+ * patched draft, for one more patch). A whole plan costs tens of thousands of output tokens and a fault in its shape is nearly
+ * always in one task or one field, so the planner is asked for that part only.
+ */
+export function applyToDraft(draft: unknown, p: PlanPatch): { plan: Plan } | { problem: string; draft?: unknown } {
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) return { problem: "the refused plan is not an object" };
+  const d = draft as Record<string, unknown>;
+  const list = (x: unknown) => (Array.isArray(x) ? x.filter((i) => !!i && typeof i === "object") : []);
+  const stubs = list(d.stubs).filter((s) => typeof (s as { path?: unknown }).path === "string" && typeof (s as { content?: unknown }).content === "string");
+  let applied: ReturnType<typeof applyPlanPatch>;
+  try { applied = applyPlanPatch({ ...d, tasks: list(d.tasks), stubs } as unknown as Plan, p); } catch (e) { return { problem: `the patch cannot be applied (${(e as Error).message})` }; }
+  if ("problem" in applied) return applied;
+  const parsed = PlanBody.safeParse(applied.plan);
+  if (parsed.success) return { plan: parsed.data };
+  const mended = mendAnswer(PlanBody, applied.plan);
+  return mended ? { plan: mended.output } : { problem: zodIssues(parsed.error), draft: applied.plan };
 }

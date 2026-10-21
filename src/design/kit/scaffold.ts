@@ -84,18 +84,30 @@ const q = (s: string): string => JSON.stringify(s);
 
 /** A design route as the Next.js App Router folder: "/accounts/:id" is app/accounts/[id]. Undefined when it cannot be one. */
 export function nextRouteDir(route: string): string | undefined {
-  const path = route.split(/[?#]/)[0]!.replace(/\/+$/, "");
+  const path = dynamicRoute(route.split(/[?#]/)[0]!.replace(/\/+$/, ""));
   const segs = path.split("/").filter(Boolean).map((s) => (s.startsWith(":") ? `[${s.slice(1)}]` : s));
   if (segs.some((s) => !/^(\[[A-Za-z_]\w*\]|[A-Za-z0-9._~-]+)$/.test(s))) return undefined;
   return segs.join("/");
 }
 /** A design route for React Router ("/accounts/[id]" written either way). */
-export const routerPath = (route: string): string => (route.split(/[?#]/)[0]!.replace(/\[([^\]]+)\]/g, ":$1").replace(/\/+$/, "") || "/");
+export const routerPath = (route: string): string => (dynamicRoute(route.split(/[?#]/)[0]!).replace(/\[([^\]]+)\]/g, ":$1").replace(/\/+$/, "") || "/");
+
+/** A path segment that is one record's sample ID (D-4823, V-04, tk-4823, 1042), not a word of the address. */
+const SAMPLE_ID = /^[A-Za-z]{0,4}[-_]?\d{2,}$/;
+
+/**
+ * A designed route with a sample record's ID in it, as a route for every record: "/deliveries/D-4823" is "/deliveries/:id". The
+ * design draws one record, and its ID is data (run 3f0f: only D-4823 had a page, so every other row's link was a 404).
+ */
+export function dynamicRoute(path: string): string {
+  let n = 0;
+  return path.split("/").map((s) => (SAMPLE_ID.test(s) ? `:${++n === 1 ? "id" : `id${n}`}` : s)).join("/");
+}
 
 /** The states a screen opens in by address: the slug, and the demo's name (its layer, its message, its full data). */
 export function screenStates(s: DesignBody["screens"][number]): Record<string, { name: string; overlay?: number; toast?: number; full?: boolean }> {
   const out: Record<string, { name: string; overlay?: number; toast?: number; full?: boolean }> = {};
-  const overlays = (s.mock?.overlays ?? []).map(overlayLabel), toasts = (s.mock?.toasts ?? []).map(toastLabel);
+  const overlays = (s.mock?.overlays ?? s.overlays ?? []).map(overlayLabel), toasts = (s.mock?.toasts ?? []).map(toastLabel);
   for (const name of demoStates(s)) {
     const o = overlays.indexOf(name), t = toasts.indexOf(name);
     out[slug(name)] = { name, ...(o >= 0 ? { overlay: o } : {}), ...(t >= 0 ? { toast: t } : {}), ...(name === FULL_DATA ? { full: true } : {}) };
@@ -103,6 +115,8 @@ export function screenStates(s: DesignBody["screens"][number]): Record<string, {
   return out;
 }
 
+/** a sign-in, log-in, sign-up or register page */
+const AUTH_ROUTE = /(^|\/)(sign-?in|log-?in|sign-?up|register)(\/|$)/i;
 const header = (tag: string, what: string): string => `// ${OWNED_MARK} from ${tag}.\n// ${what}\n`;
 
 /** The scaffold for a design: every file, and what each task gets. Pure: reads the repo through `src` only. */
@@ -339,18 +353,28 @@ export function scaffold(o: ScaffoldInput): ScaffoldLayout {
     }
   }
 
-  // the frame: each app's navigation (its pages without a record id, in their groups)
+  // the frame: each app's navigation (its pages without a record id, in their groups); signing in or up is no place to
+  // go once signed in (run 4049 listed both in every page's nav)
   const frameApps = kitApps.map((a) => {
     const own = out.filter((x) => inApp(o.design.screens.find((s) => s.id === x.id)!, a));
-    const nav = own.filter((x) => !/[:[]/.test(x.route)).map((x) => ({ label: x.title, route: routerPath(x.route), ...(o.design.screens.find((s) => s.id === x.id)?.group ? { group: o.design.screens.find((s) => s.id === x.id)!.group } : {}) }));
+    // each page for its own kind of user (run 4049 listed the admin pages to employees and the gate guard)
+    const nav = own.filter((x) => !/[:[]/.test(x.route) && !AUTH_ROUTE.test(x.route)).map((x) => {
+      const s = o.design.screens.find((y) => y.id === x.id);
+      return { label: x.title, route: routerPath(x.route), ...(s?.group ? { group: s.group } : {}), ...(s?.user ? { roles: [s.user] } : {}) };
+    });
     const shellOf = (): string => {
       if (a.shell && a.shell !== "auto") return a.shell;
       const tool = own.filter((x) => o.design.screens.find((s) => s.id === x.id)?.mock?.blocks.some((b) => b.type === "table" || b.type === "stats")).length;
       return own.length > 0 && tool * 2 >= own.length ? "sidebar" : "topbar";
     };
     const sw = "switcher" in a && a.switcher ? a.switcher : kitApps.length < 2 ? o.design.switcher : undefined;
-    return { id: a.id || "app", name: a.name, shell: shellOf(), nav, ...(sw ? { switcher: sw } : {}), routes: own.map((x) => routerPath(x.route)) };
+    // sign-in and sign-up draw their own brand and show no frame: run 4049's sign-in listed the pages, and their prefetched
+    // redirect to sign-in sent the person back there after signing in
+    const auth = own.filter((x) => AUTH_ROUTE.test(x.route)).map((x) => routerPath(x.route));
+    return { id: a.id || "app", name: a.name, shell: shellOf(), nav, ...(sw ? { switcher: sw } : {}), routes: own.map((x) => routerPath(x.route)), ...(auth.length ? { auth } : {}) };
   });
+  // the address alone opens the product: with no page at "/", it goes to the first page listed (run 4049's "/" was a 404)
+  const home = routes.has(next ? "" : "/") ? undefined : (frameApps[0]?.nav[0]?.route ?? frameApps[0]?.routes.find((r) => !r.includes(":")));
   const lang = o.design.locale?.languages[0] ?? "en";
   const framePath = at("components/screens/frame.ts");
   const providersPath = at("components/screens/providers.tsx");
@@ -378,6 +402,15 @@ export function scaffold(o: ScaffoldInput): ScaffoldLayout {
     `}`,
     ``,
   ].join("\n"), "glue", true);
+  if (next && home) add(at("app/page.tsx"), [
+    header(o.tag, `The product's address: it opens ${home}.`),
+    `import { redirect } from "next/navigation";`,
+    ``,
+    `export default function Home() {`,
+    `  redirect(${q(home)});`,
+    `}`,
+    ``,
+  ].join("\n"), "glue", true);
   }
 
   // the product's words in its other language
@@ -399,7 +432,7 @@ export function scaffold(o: ScaffoldInput): ScaffoldLayout {
     add(rp, [
       header(o.tag, "A route per approved page, each opening in any state with ?fixture=S-3:empty. Add them to the app's router."),
       `import type { ReactNode } from "react";`,
-      `import { useSearchParams, type RouteObject } from "react-router";`,
+      `import { ${fresh && home ? "Navigate, " : ""}useSearchParams, type RouteObject } from "react-router";`,
       `import { fixtureState } from "${imp("lib/fixture", rp)}";`,
       ...out.filter((x) => x.page).map((x) => `import { ${x.containerName} } from "${imp(`components/screens/${x.id.toLowerCase()}/container`, rp)}";`),
       ``,
@@ -410,6 +443,7 @@ export function scaffold(o: ScaffoldInput): ScaffoldLayout {
       ``,
       `export const designRoutes: RouteObject[] = [`,
       ...out.filter((x) => x.page).map((x) => `  { path: ${q(routerPath(x.route))}, element: <Fixture id=${q(x.id)} page={(f) => <${x.containerName} fixture={f} />} /> },`),
+      ...(fresh && home ? [`  { path: "/", element: <Navigate to=${q(home)} replace /> },`] : []),
       `];`,
       ``,
     ].join("\n"), "glue", true);
@@ -420,7 +454,7 @@ export function scaffold(o: ScaffoldInput): ScaffoldLayout {
 
   // screen tests ("ui" criteria): the navigation stand-in and the setup every test file runs after (factory-owned)
   add(SCREEN_HELPER, screenHelperFile(o.tag), "glue", true);
-  add(SCREEN_SETUP, screenSetupFile(o.tag), "glue", true);
+  add(SCREEN_SETUP, screenSetupFile(o.tag, next), "glue", true);
 
   // a fresh app's skeleton, or what the design-system task must wire in an existing one
   const kitDeps = { ...o.kit.manifest.dependencies, ...o.kit.manifest.targetDependencies[o.target] };

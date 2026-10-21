@@ -4,6 +4,8 @@
 // gatherRequest like `--file`; a Jira key goes through gatherRequest like `--jira`.
 import type { AppsDeps } from "../fullstack/apps.js";
 import { MANUAL_CARD, SIGN_OFF, readChecks, type ManualBundle } from "../stages/manual-check.js";
+import { checkIntentEdit, webIntentEdit } from "../stages/intent-edits.js";
+import type { ClientIntentBody } from "../contracts/artifacts.js";
 import { INTERRUPTED, shownStatus } from "../stages/run-status.js";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
@@ -73,6 +75,8 @@ export interface StartInput {
   fresh?: unknown;
   /** a build: the stack the approved design is built in when the project sets none, like --ui-target */
   uiTarget?: unknown;
+  /** whether a Stitch design draws its main pages at phone width too, like --mobile-design; over the project's design.stitch.phone */
+  mobileDesign?: unknown;
   /** the models for this run, like --preset and --model: { preset?: "economy" | "balanced" | "quality", picks?: { step: model } } */
   models?: unknown;
 }
@@ -228,6 +232,8 @@ export async function startRun(input: StartInput, deps: StartDeps = {}): Promise
   if (uiTargetIn && greenfieldAsked) throw new StartError("A new product is built on the factory's own kit; there is no UI target to choose.");
   let uiTarget: UiTarget | undefined;
   try { uiTarget = uiTargetOption(uiTargetIn || undefined); } catch (err) { throw new StartError((err as Error).message.replace("--ui-target", "The UI target")); }
+  if (input.mobileDesign !== undefined && input.mobileDesign !== null && typeof input.mobileDesign !== "boolean") throw new StartError("Mobile design is true or false.");
+  const mobileDesign = typeof input.mobileDesign === "boolean" ? input.mobileDesign : undefined;
 
   const fromEstimate = str(input.fromEstimate)?.trim();
   if (fromEstimate && estimating) throw new StartError(designing ? "A design run starts from requirements, not from an estimate." : "A build starts from an estimate; an estimate cannot.");
@@ -332,13 +338,14 @@ export async function startRun(input: StartInput, deps: StartDeps = {}): Promise
   }
   const runId = await createRun(req.text, project, `${userInfo().username} (via web)`, {
     ...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
-    sources: req.sources, ...(references.length ? { references } : {}),
+    sources: req.sources, ...(references.length ? { references } : {}), ...("transcript" in req && req.transcript ? { transcript: req.transcript } : {}),
     ...(approved ? { lineage: { kind: "build" as const, approved } } : change ? { lineage: { kind: "change" as const, approved: change } } : {}),
     ...(fromDesign ? { fromDesign } : {}),
     ...(greenfield ? { mode: "greenfield" as const } : {}),
     ...(settings ? { mode: designing ? "design" as const : "estimate" as const, estimate: settings, attachments: req.attachments } : {}),
     ...(designExport ? { designExport } : {}),
     ...(uiTarget ? { uiTarget } : {}),
+    ...(mobileDesign !== undefined ? { mobileDesign } : {}),
     models,
   });
   if (!standalone) starting.set(project, { runId, at: Date.now() });
@@ -433,7 +440,7 @@ export async function answerQuestions(ledger: Ledger, input: AnswersInput, deps:
 }
 
 /** The cards a person may approve or send back on the run page besides an estimate: the design (E1b) and the spec and plan, with its API contract. */
-export const WEB_DECIDED = ["design-approval", "approval", "understood", "spec-review"] as const;
+export const WEB_DECIDED = ["design-approval", "approval", "understood", "spec-review", "intent"] as const;
 
 export interface CardDecisionInput { hash?: unknown; decision?: unknown; by?: unknown; note?: unknown; reason?: unknown }
 
@@ -467,6 +474,30 @@ export async function decideCard(ledger: Ledger, input: CardDecisionInput, deps:
     data = { note };
   }
   return record(ledger, { decision, hashPrefix: hash, by: `${name} (via web)`, data }, deps);
+}
+
+export interface IntentEditInput { hash?: unknown; by?: unknown; reason?: unknown; status?: unknown; remove?: unknown; add?: unknown; roles?: unknown }
+
+/**
+ * An edit of the open client-intent card from the run page, as `factory edit-intent` records it (spec 2026-10-14 transcript-intent §5c):
+ * a typed name, the card's hash (checked under the ledger lock), a reason, and the changes, checked against the intent the card shows.
+ * The run rebuilds the card from the edits without asking the model again.
+ */
+export async function editIntent(ledger: Ledger, input: IntentEditInput, deps: StartDeps = {}): Promise<{ recorded: boolean }> {
+  const open = replay(ledger.events()).openCard;
+  if (open?.kind !== "intent") throw new StartError("This run has no client-intent card waiting for a decision.", 409);
+  const hash = str(input.hash)?.trim() ?? "";
+  if (hash.length < 8) throw new StartError("Send the card's hash from this page.");
+  const name = typedName(input.by, "Type your name to save the edits; it is recorded with them.");
+  const reason = str(input.reason)?.trim() ?? "";
+  if (!reason) throw new StartError("Say why you are changing the intent; it is shown on the card.");
+  if (reason.length > 2000) throw new StartError("The reason is too long (2000 characters at most).");
+  let edits;
+  try { edits = webIntentEdit(input); } catch (e) { throw new StartError((e as Error).message); }
+  const shown = ledger.getJson<{ intent?: ClientIntentBody }>(open.artifactSha)?.intent;
+  const problems = shown ? checkIntentEdit(edits, shown) : ["the card's intent is missing from the run"];
+  if (problems.length) throw new StartError(`Can't apply that edit: ${problems.join("; ")}`);
+  return record(ledger, { decision: "edit", hashPrefix: hash, by: `${name} (via web)`, data: { edits, reason } }, deps);
 }
 
 export interface ManualChecksInput { hash?: unknown; by?: unknown; checks?: unknown }
