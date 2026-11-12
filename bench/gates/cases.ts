@@ -1,9 +1,12 @@
 // Seeded-defect cases. Each case names a gate, an input, and what the gate must do with it.
 //   must-fail  the defect is real: the gate has to catch it (a pass here is a MISS)
 //   must-pass  the input is clean: the gate has to let it through (a fail here is a FALSE POSITIVE)
+//   knownGap   an open finding: the case is expected to come out wrong until the gate is fixed
 // Gates that aren't registered yet report "pending", so this file can grow ahead of the gates.
 import type { DiffSummary } from "../../src/gates/predicates.js";
 import { ESTIMATE_CASES } from "./estimate-cases.js";
+import { SAFETY_CASES } from "./safety-cases.js";
+import { FLOW_CASES } from "./flow-cases.js";
 
 export interface GateCase {
   id: string;
@@ -11,6 +14,9 @@ export interface GateCase {
   description: string;
   expect: "must-fail" | "must-pass";
   input: unknown;
+  /** An open finding: the gate is known to get this case wrong (the bug key or a short note). Reported as
+   *  "known-gap" without failing the suite, and flagged as "gap-fixed" once the gate gets it right. */
+  knownGap?: string;
 }
 
 // ---------- existing gates: prove the harness on gates that already exist ----------
@@ -28,4 +34,4 @@ const existing: GateCase[] = [
   { id: "lock-set/deleted", gateId: "task.lock-set-unchanged", description: "locked test file deleted", expect: "must-fail", input: { diff: { ...diff([]), lockedNow: { "t.test.ts": null } }, tests: { lock: [{ file: "t.test.ts", sha: "s1" }] } } },
 ];
 
-export const CASES: GateCase[] = [...existing, ...ESTIMATE_CASES];
+export const CASES: GateCase[] = [...existing, ...ESTIMATE_CASES, ...SAFETY_CASES, ...FLOW_CASES];
